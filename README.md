@@ -41,3 +41,5 @@ python app/native_wallpaper.py
 会员资源不会被伪装成“已同步”：在没有官方授权接口前，本程序只能显示官网下载页公开展示的资源，或处理你从官方渠道明确导出的静态图片/直链。
 
 `app/catalog.py` 定义了认证、分类、分页、搜索、预览和原图下载的数据源契约。元气正式适配器在缺少官方 OAuth/API 配置时会显式拒绝返回数据，不会用网页套壳或模拟响应冒充接通。
+
+官方客户端登录与 H5 原生桥的实机研究记录见 [`docs/yuanqi-auth-architecture.md`](docs/yuanqi-auth-architecture.md)。
