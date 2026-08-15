@@ -138,8 +138,9 @@ ABI、授权回调规范以及资源服务端校验权限。缺少任一项时�
 - `kwallpaperui.exe`：包含 `KUserInfoDlg`、`DelayLoginTask`、
   `UserInfoManager`；负责登录窗口和登录后用户状态刷新；
 - 同一模块包含 `DownloadQRCodeTask`、`QRCodeQueryWorker`、
-  `QueryScanTask`、`QRCodeScanListener`；说明“使用其他账号”中的扫码是原生任务，
-  不是官网里隐藏的登录表单；
+  `QueryScanTask`、`QRCodeScanListener`。进一步恢复虚表并反汇编后确认这些类引用的是
+  `/v1/promote/qrcode` 和推广下载参数，属于分享/推广二维码，不能再作为微信登录实现
+  的证据；
 - `kvipgui.exe`：包含 `GetRecentCommonLoginList`、`DelRecentLoginData`、
   `login_type`、`product_login_list` 等入口；这与实机看到的“上次登录账号 + 一键登录”
   相吻合；
