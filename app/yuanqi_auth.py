@@ -93,6 +93,19 @@ class QQLoginSurface:
 QQ_LOGIN_SURFACE = QQLoginSurface()
 
 
+@dataclass(frozen=True)
+class QQAuthReturnSurface:
+    """QQ 授权成功回到元气主宿主后实机可见的非秘密信号。"""
+
+    external_window_closed: bool = True
+    quick_login_dialog_closed: bool = True
+    account_avatar_replaces_login_button: bool = True
+    authenticated_tab_label: str = "关注"
+
+
+QQ_AUTH_RETURN_SURFACE = QQAuthReturnSurface()
+
+
 class AuthPhase(str, Enum):
     UNAVAILABLE = "unavailable"
     SIGNED_OUT = "signed_out"

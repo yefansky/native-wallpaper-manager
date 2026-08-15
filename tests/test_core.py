@@ -16,6 +16,7 @@ from yuanqi_auth import (
     LOGIN_OPTIONS,
     PHONE_LOGIN_SURFACE,
     QQ_LOGIN_SURFACE,
+    QQ_AUTH_RETURN_SURFACE,
     QQLoginMethod,
     LoginInteraction,
     LoginProvider,
@@ -92,6 +93,12 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(QQ_LOGIN_SURFACE.relying_party, "金山毒霸")
         self.assertEqual(QQ_LOGIN_SURFACE.permission_scope, "使用你的QQ头像、昵称信息")
 
+    def test_qq_auth_return_surface_matches_observed_host_refresh(self):
+        self.assertTrue(QQ_AUTH_RETURN_SURFACE.external_window_closed)
+        self.assertTrue(QQ_AUTH_RETURN_SURFACE.quick_login_dialog_closed)
+        self.assertTrue(QQ_AUTH_RETURN_SURFACE.account_avatar_replaces_login_button)
+        self.assertEqual(QQ_AUTH_RETURN_SURFACE.authenticated_tab_label, "关注")
+
     def test_yuanqi_login_provider_state_transitions(self):
         class FakeBackend:
             def configured(self): return True
@@ -134,14 +141,16 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("123456", repr(snapshot))
 
     def test_yuanqi_login_requires_callback_then_server_verification(self):
+        events = []
+
         class FakeBackend:
             def configured(self): return True
-            def navigate_to_login(self): self.opened = True
+            def navigate_to_login(self): self.opened = True; events.append("navigate")
             def request_phone_code(self, phone_number): pass
             def submit_phone_login(self, phone_number, verification_code): pass
-            def get_user_info(self): return {"uid": "user-1", "token": "session-secret", "provider": "QQ"}
-            def get_device_info(self): return {"deviceId": "device-1"}
-            def verify_session(self, session): return session.complete
+            def get_user_info(self): events.append("user"); return {"uid": "user-1", "token": "session-secret", "provider": "QQ"}
+            def get_device_info(self): events.append("device"); return {"deviceId": "device-1"}
+            def verify_session(self, session): events.append("verify"); return session.complete
 
         backend = FakeBackend()
         auth = YuanqiAuthCoordinator(backend)
@@ -151,6 +160,24 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.phase, AuthPhase.AUTHENTICATED)
         self.assertTrue(result.has_session)
         self.assertEqual(result.provider, "QQ")
+        self.assertEqual(events, ["navigate", "user", "device", "verify"])
+
+    def test_visible_host_refresh_does_not_bypass_login_callback(self):
+        class FakeBackend:
+            def configured(self): return True
+            def navigate_to_login(self): pass
+            def request_phone_code(self, phone_number): pass
+            def submit_phone_login(self, phone_number, verification_code): pass
+            def get_user_info(self): raise AssertionError("失败回调后不应读取用户信息")
+            def get_device_info(self): raise AssertionError("失败回调后不应读取设备信息")
+            def verify_session(self, session): raise AssertionError("失败回调后不应校验会话")
+
+        auth = YuanqiAuthCoordinator(FakeBackend())
+        auth.begin_login()
+        auth.select_login_provider(LoginProvider.QQ)
+        result = auth.callback_on_login(False)
+        self.assertEqual(result.phase, AuthPhase.SIGNED_OUT)
+        self.assertFalse(result.has_session)
 
     def test_legacy_featured_sources_are_migrated_and_deduplicated(self):
         title = app.OFFICIAL_FEATURED[0][0]

@@ -24,6 +24,7 @@ from yuanqi_auth import (
     LOGIN_OPTIONS,
     PHONE_LOGIN_SURFACE,
     QQ_LOGIN_SURFACE,
+    QQ_AUTH_RETURN_SURFACE,
     UnavailableYuanqiLoginBackend,
     YuanqiAuthCoordinator,
 )
@@ -413,6 +414,10 @@ class App:
             f"{QQ_LOGIN_SURFACE.window_title} / 默认扫码 / {QQ_LOGIN_SURFACE.password_login_label} / "
             f"授权方：{QQ_LOGIN_SURFACE.relying_party}"
         )
+        qq_return = (
+            f"授权窗关闭 → 头像替换登录按钮 → 出现“{QQ_AUTH_RETURN_SURFACE.authenticated_tab_label}” → "
+            "桥回调/会话校验"
+        )
         messagebox.showinfo(
             "元气电脑版登录桥自检",
             "已复刻并测试的原生桥契约：\n\n"
@@ -420,6 +425,7 @@ class App:
             f"实机登录入口：{options}（默认微信二维码）。\n\n"
             f"手机登录：{phone_flow}。\n\n"
             f"QQ 登录：{qq_flow}。\n\n"
+            f"QQ 回流：{qq_return}。\n\n"
             "状态流：拉起登录 → 选择入口/本人认证 → 登录回调 → 用户/设备信息 → 服务端校验。\n\n"
             f"当前：{self.yuanqi_auth.snapshot.message}",
         )
