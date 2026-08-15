@@ -16,7 +16,13 @@
 
 ## 运行
 
-Windows 上双击 `run.bat`，或执行：
+首次运行先安装图库预览依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+然后双击 `run.bat`，或执行：
 
 ```powershell
 python app/native_wallpaper.py
