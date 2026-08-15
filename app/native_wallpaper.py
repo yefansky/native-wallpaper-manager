@@ -16,9 +16,12 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageOps, ImageTk
 
+from catalog import YuanqiOfficialApiSource
+
 APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
 WALLPAPER_DIR = APP_DIR / "wallpapers"
 CONFIG_PATH = APP_DIR / "config.json"
+THEME_DIR = APP_DIR / "themes"
 IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png"}
 OFFICIAL_FEATURED = (
     ("樱花树下的少女", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm7.png"),
@@ -26,6 +29,24 @@ OFFICIAL_FEATURED = (
     ("云朵与少女", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm5.png"),
     ("无缝风铃蝴蝶房屋独寂", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm4.png"),
     ("中国故宫少女", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm6.png"),
+)
+OFFICIAL_SHOWCASE_URL = "https://www.yuanqidesk.com/"
+OFFICIAL_CATALOG_URL = "https://bizhi.cheetahfun.com/"
+OFFICIAL_FEATURED_SOURCE = "元气官网首页公开展示"
+OFFICIAL_STATIC_CATEGORIES = (
+    ("全部静态", "https://bizhi.cheetahfun.com/dn/j/"),
+    ("4K", "https://bizhi.cheetahfun.com/tag_93_07530310f9c29fbc88118c6eb8bb2047}/"),
+    ("风景", "https://bizhi.cheetahfun.com/dn/c1j/"),
+    ("小清新", "https://bizhi.cheetahfun.com/dn/c10j/"),
+    ("动漫", "https://bizhi.cheetahfun.com/dn/c2j/"),
+    ("明星", "https://bizhi.cheetahfun.com/dn/c5j/"),
+    ("美女", "https://bizhi.cheetahfun.com/dn/c3j/"),
+    ("科幻", "https://bizhi.cheetahfun.com/dn/c7j/"),
+    ("动物", "https://bizhi.cheetahfun.com/dn/c6j/"),
+    ("游戏", "https://bizhi.cheetahfun.com/dn/c4j/"),
+    ("体育", "https://bizhi.cheetahfun.com/dn/c9j/"),
+    ("汽车", "https://bizhi.cheetahfun.com/dn/c8j/"),
+    ("其他", "https://bizhi.cheetahfun.com/dn/c11j/"),
 )
 SPI_SETDESKWALLPAPER = 20
 SPIF_UPDATEINIFILE = 0x01
@@ -93,6 +114,7 @@ class App:
         self.root.minsize(1000, 640)
         self.root.configure(bg=BG)
         self.config = load_config()
+        self.yuanqi_source = YuanqiOfficialApiSource()
         self.items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
         self.filter_favorites = False
         self.selected_id = self.config.get("last_applied") or (self.items[0].id if self.items else None)
@@ -112,21 +134,24 @@ class App:
         header = tk.Frame(self.root, bg=PANEL, height=78)
         header.pack(fill="x"); header.pack_propagate(False)
         tk.Label(header, text="桌面画廊", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 20, "bold")).pack(side="left", padx=(28, 8))
-        tk.Label(header, text="原生静态壁纸", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
-        controls = tk.Frame(header, bg=PANEL); controls.pack(side="right", padx=24)
-        self.button(controls, "导入图片", self.import_images).pack(side="left", padx=4)
-        self.button(controls, "同步精选", self.sync_official_featured).pack(side="left", padx=4)
-        self.button(controls, "下载直链", self.download_url).pack(side="left", padx=4)
-        self.button(controls, "定时切换", self.open_settings).pack(side="left", padx=4)
+        tk.Label(header, text="Windows 原生模式", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        nav = tk.Frame(header, bg="#f1f3f7"); nav.pack(side="left", padx=36, pady=15)
+        self.nav_buttons = {}
+        for key, label in (("wallpaper", "本地壁纸"), ("official", "官方资源"), ("theme", "电脑主题"), ("beauty", "系统美化"), ("components", "组件"), ("mine", "我的")):
+            button = tk.Button(nav, text=label, command=lambda name=key: self.show_page(name), relief="flat", cursor="hand2", bd=0,
+                               bg="#f1f3f7", fg=TEXT, activebackground=GOLD, font=("Microsoft YaHei UI", 10, "bold"), padx=16, pady=10)
+            button.pack(side="left", padx=2); self.nav_buttons[key] = button
+        self.button(header, "定时切换", self.open_settings).pack(side="right", padx=24)
 
-        body = tk.Frame(self.root, bg=BG); body.pack(fill="both", expand=True, padx=22, pady=18)
+        body = tk.Frame(self.root, bg=BG)
+        self.library_page = body
         sidebar = tk.Frame(body, bg=PANEL, width=180); sidebar.pack(side="left", fill="y", padx=(0, 18)); sidebar.pack_propagate(False)
         tk.Label(sidebar, text="我的资料库", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=18, pady=(22, 10))
         self.all_button = self.button(sidebar, "全部壁纸", self.show_all, width=13); self.all_button.pack(padx=16, pady=3)
         self.favorite_button = self.button(sidebar, "我的收藏", self.show_favorites, width=13); self.favorite_button.pack(padx=16, pady=3)
         tk.Frame(sidebar, bg=LINE, height=1).pack(fill="x", padx=18, pady=20)
         tk.Label(sidebar, text="资源来源", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=18)
-        tk.Label(sidebar, text="· 本地导入\n· 官网公开精选\n· 已授权图片直链", justify="left", bg=PANEL, fg=TEXT,
+        tk.Label(sidebar, text="· 本地导入\n· 元气官网首页公开展示\n· 已授权图片直链", justify="left", bg=PANEL, fg=TEXT,
                  font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w", padx=18)
         self.button(sidebar, "打开元气官网", self.open_official_site, width=13).pack(side="bottom", pady=18)
 
@@ -144,6 +169,9 @@ class App:
         gallery_header = tk.Frame(main, bg=BG); gallery_header.pack(fill="x", pady=(18, 8))
         tk.Label(gallery_header, text="壁纸图库", bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(side="left")
         self.count_label = tk.Label(gallery_header, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9)); self.count_label.pack(side="left", padx=10)
+        self.button(gallery_header, "导入", self.import_images).pack(side="right", padx=3)
+        self.button(gallery_header, "直链下载", self.download_url).pack(side="right", padx=3)
+        self.button(gallery_header, "同步精选", self.sync_official_featured).pack(side="right", padx=3)
         self.gallery_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(main, orient="vertical", command=self.gallery_canvas.yview)
         self.gallery_canvas.configure(yscrollcommand=scrollbar.set)
@@ -153,8 +181,93 @@ class App:
         self.gallery.bind("<Configure>", lambda _event: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all")))
         self.gallery_canvas.bind("<Configure>", lambda event: self.gallery_canvas.itemconfigure(self.gallery_window, width=event.width))
         self.root.bind_all("<MouseWheel>", lambda event: self.gallery_canvas.yview_scroll(int(-event.delta / 120), "units"))
+        self.theme_page = self.build_theme_page()
+        self.official_page = self.build_official_page()
+        self.beauty_page = self.build_beauty_page()
+        self.components_page = self.build_components_page()
+        self.mine_page = self.build_mine_page()
+        self.pages = {"wallpaper": self.library_page, "official": self.official_page, "theme": self.theme_page, "beauty": self.beauty_page, "components": self.components_page, "mine": self.mine_page}
         tk.Label(self.root, textvariable=self.status, bg="#eef0f5", fg="#53607a", anchor="w", padx=24, pady=10,
                  font=("Microsoft YaHei UI", 9)).pack(fill="x", side="bottom")
+        self.show_page("wallpaper")
+
+    def show_page(self, name: str) -> None:
+        for page in self.pages.values(): page.pack_forget()
+        self.pages[name].pack(fill="both", expand=True, padx=22, pady=18)
+        for key, button in self.nav_buttons.items():
+            button.configure(bg=GOLD if key == name else "#f1f3f7")
+        if name == "theme": self.refresh_theme_preview()
+        if name == "mine": self.refresh_mine_summary()
+
+    def page_header(self, page: tk.Frame, title: str, description: str) -> None:
+        tk.Label(page, text=title, bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 21, "bold")).pack(anchor="w", pady=(6, 2))
+        tk.Label(page, text=description, bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(0, 18))
+
+    def native_card(self, parent: tk.Frame, title: str, description: str, button_text: str, command) -> tk.Frame:
+        card = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=22, pady=20)
+        tk.Label(card, text=title, bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        tk.Label(card, text=description, bg=PANEL, fg=MUTED, justify="left", wraplength=340, font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w")
+        self.button(card, button_text, command, accent=True).pack(anchor="w", pady=(6, 0))
+        return card
+
+    def build_theme_page(self) -> tk.Frame:
+        page = tk.Frame(self.root, bg=BG); self.page_header(page, "电脑主题", "生成并应用 Windows 标准 .theme 文件；没有桌面覆盖层。")
+        content = tk.Frame(page, bg=BG); content.pack(fill="both", expand=True)
+        preview = tk.Frame(content, bg=PANEL, padx=22, pady=22); preview.pack(side="left", fill="both", expand=True, padx=(0, 14))
+        tk.Label(preview, text="主题预览", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        self.theme_image = tk.Label(preview, bg="#d8dce6"); self.theme_image.pack(fill="both", expand=True, pady=12)
+        self.theme_title = tk.Label(preview, text="", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 16, "bold")); self.theme_title.pack(anchor="w")
+        tk.Label(preview, text="包含当前静态壁纸与 Windows 原生图片幻灯片配置。", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=5)
+        actions = tk.Frame(content, bg=BG, width=360); actions.pack(side="right", fill="y")
+        self.native_card(actions, "生成 Windows 主题", "在本地创建可双击应用的 .theme 文件，图片轮换由 Windows 管理。", "生成主题文件", self.create_native_theme).pack(fill="x", pady=(0, 12))
+        self.native_card(actions, "应用当前主题", "交给 Windows 个性化机制应用；仅改变主题和壁纸，不创建桌面层。", "用 Windows 应用", self.apply_native_theme).pack(fill="x")
+        return page
+
+    def build_official_page(self) -> tk.Frame:
+        page = tk.Frame(self.root, bg=BG)
+        capabilities = self.yuanqi_source.capabilities()
+        self.page_header(page, "元气官方资源", "真实、持续更新的元气壁纸公开分类；浏览行为由官方网页处理。")
+        notice = tk.Frame(page, bg="#fff7df", highlightbackground="#f1d28a", highlightthickness=1, padx=18, pady=14)
+        notice.pack(fill="x", pady=(0, 14))
+        tk.Label(notice, text="已核验：官方站提供真实分类、详情、作者、尺寸与预览。公开站没有会员 OAuth，高清下载仍交给官方客户端。",
+                 bg="#fff7df", fg=TEXT, justify="left", wraplength=980, font=("Microsoft YaHei UI", 10)).pack(anchor="w")
+        tk.Label(notice, text=f"正式接入状态：{capabilities.reason} 本页不会伪造登录态、会员权限或资源数量。", bg="#fff7df", fg=PINK,
+                 font=("Microsoft YaHei UI", 9, "bold"), pady=4).pack(anchor="w")
+        grid = tk.Frame(page, bg=BG); grid.pack(fill="both", expand=True)
+        for index, (label, url) in enumerate(OFFICIAL_STATIC_CATEGORIES):
+            self.button(grid, label, lambda target=url: self.open_official_catalog(target), accent=index == 0, width=12).grid(
+                row=index // 5, column=index % 5, sticky="nsew", padx=7, pady=7
+            )
+        for column in range(5): grid.grid_columnconfigure(column, weight=1)
+        self.button(page, "打开元气完整壁纸站", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL), accent=True).pack(anchor="e", pady=12)
+        return page
+
+    def build_beauty_page(self) -> tk.Frame:
+        page = tk.Frame(self.root, bg=BG); self.page_header(page, "系统美化", "只进入 Windows 原生设置，不注入任务栏、不覆盖桌面。")
+        grid = tk.Frame(page, bg=BG); grid.pack(fill="both", expand=True)
+        cards = (("鼠标指针", "使用 Windows 鼠标指针方案；主题文件也可以包含 .cur/.ani。", "打开鼠标设置", lambda: self.open_windows_uri("main.cpl")),
+                 ("颜色与深浅模式", "使用 Windows 个性化颜色、深色或浅色模式。", "打开颜色设置", lambda: self.open_windows_uri("ms-settings:colors")),
+                 ("系统声音", "使用 Windows 声音方案；主题文件可引用 .wav。", "打开声音设置", lambda: self.open_windows_uri("mmsys.cpl")),
+                 ("通知与专注", "只使用 Windows 通知与专注设置；不做第三方进程弹窗拦截。", "打开通知设置", lambda: self.open_windows_uri("ms-settings:notifications")))
+        for index, values in enumerate(cards): self.native_card(grid, *values).grid(row=index // 2, column=index % 2, sticky="nsew", padx=7, pady=7)
+        grid.grid_columnconfigure((0, 1), weight=1)
+        return page
+
+    def build_components_page(self) -> tk.Frame:
+        page = tk.Frame(self.root, bg=BG); self.page_header(page, "组件", "只保留 Windows 有稳定原生入口的项目。")
+        grid = tk.Frame(page, bg=BG); grid.pack(fill="both", expand=True)
+        self.native_card(grid, "锁屏图片", "Windows 原生锁屏设置。系统策略限制时由 Windows 自己提示。", "打开锁屏设置", lambda: self.open_windows_uri("ms-settings:lockscreen")).grid(row=0, column=0, sticky="nsew", padx=7, pady=7)
+        self.native_card(grid, "桌面助手", "不实现。悬浮式图标整理会在远程桌面、分辨率切换时破坏 Explorer。", "查看原因", self.show_safety_notice).grid(row=0, column=1, sticky="nsew", padx=7, pady=7)
+        self.native_card(grid, "弹窗拦截", "不实现全局拦截；仅通过 Windows 通知/专注模式管理提醒。", "查看原因", self.show_safety_notice).grid(row=1, column=0, sticky="nsew", padx=7, pady=7)
+        self.native_card(grid, "桌面时钟", "不实现常驻桌面层；可使用 Windows 锁屏和小组件。", "查看原因", self.show_safety_notice).grid(row=1, column=1, sticky="nsew", padx=7, pady=7)
+        grid.grid_columnconfigure((0, 1), weight=1)
+        return page
+
+    def build_mine_page(self) -> tk.Frame:
+        page = tk.Frame(self.root, bg=BG); self.page_header(page, "我的", "本地资料库、收藏和 Windows 主题文件。")
+        self.mine_summary = tk.Label(page, text="", bg=PANEL, fg=TEXT, justify="left", anchor="nw", padx=24, pady=24, font=("Microsoft YaHei UI", 12))
+        self.mine_summary.pack(fill="x")
+        return page
 
     def visible_items(self) -> list[Wallpaper]:
         return [item for item in self.items if item.favorite or not self.filter_favorites]
@@ -218,6 +331,55 @@ class App:
     def show_all(self) -> None:
         self.filter_favorites = False; self.refresh()
 
+    def refresh_theme_preview(self) -> None:
+        item = self.selected()
+        if not item:
+            self.theme_image.configure(image=""); self.theme_title.configure(text="请先导入一张静态壁纸"); return
+        photo = self.image_for(Path(item.path), (620, 340)); self.photo_refs.append(photo)
+        self.theme_image.configure(image=photo); self.theme_title.configure(text=f"{item.title} · 原生主题")
+
+    def theme_path(self) -> Path:
+        return THEME_DIR / "桌面画廊-当前主题.theme"
+
+    def create_native_theme(self) -> Path | None:
+        item = self.selected()
+        if not item:
+            messagebox.showinfo("请选择壁纸", "请先在静态壁纸页选择一张图片。"); return None
+        THEME_DIR.mkdir(parents=True, exist_ok=True)
+        images = [entry for entry in self.items if Path(entry.path).exists()]
+        lines = [
+            "[Theme]", f"DisplayName=桌面画廊 - {item.title}", "",
+            "[Control Panel\\Desktop]", f"Wallpaper={item.path}", "TileWallpaper=0", "WallpaperStyle=10", "",
+            "[Slideshow]", "Interval=1800000", "Shuffle=1", f"ImagesRootPath={WALLPAPER_DIR}",
+        ]
+        for index, entry in enumerate(images): lines.append(f"Item{index}Path={entry.path}")
+        self.theme_path().write_text("\r\n".join(lines) + "\r\n", encoding="utf-16")
+        self.status.set(f"已生成 Windows 原生主题：{self.theme_path().name}")
+        return self.theme_path()
+
+    def apply_native_theme(self) -> None:
+        path = self.create_native_theme()
+        if not path: return
+        try:
+            os.startfile(path)
+            self.status.set("已交给 Windows 应用主题；没有桌面覆盖层。")
+        except OSError as exc:
+            messagebox.showerror("应用失败", str(exc))
+
+    def open_windows_uri(self, target: str) -> None:
+        try:
+            os.startfile(target)
+            self.status.set("已打开 Windows 原生设置。")
+        except OSError as exc:
+            messagebox.showerror("无法打开 Windows 设置", str(exc))
+
+    def show_safety_notice(self) -> None:
+        messagebox.showinfo("稳定模式", "此功能需要桌面覆盖层或全局注入，远程桌面和分辨率变化时可能造成图标、右键或 Explorer 异常，因此稳定模式不实现。")
+
+    def refresh_mine_summary(self) -> None:
+        favorites = sum(item.favorite for item in self.items)
+        self.mine_summary.configure(text=f"本地资料库\n\n{len(self.items)} 张静态壁纸\n{favorites} 张收藏\n\n主题文件\n{self.theme_path()}\n\n资源全部存放在本机，不保存元气账号 Cookie 或令牌。")
+
     def show_favorites(self) -> None:
         self.filter_favorites = True; self.refresh()
 
@@ -238,8 +400,8 @@ class App:
         existing = {(item.title, item.source) for item in self.items}; added = 0
         try:
             for title, url in OFFICIAL_FEATURED:
-                if (title, "元气官网公开精选") not in existing:
-                    self.items.append(download_static_image(url, title, "元气官网公开精选")); added += 1
+                if (title, OFFICIAL_FEATURED_SOURCE) not in existing:
+                    self.items.append(download_static_image(url, title, OFFICIAL_FEATURED_SOURCE)); added += 1
             if self.items: self.selected_id = self.items[-1].id
             self.refresh(); self.status.set("官网精选已是最新。" if not added else f"已同步 {added} 张官网公开精选。")
         except (OSError, ValueError) as exc: messagebox.showerror("同步失败", str(exc))
@@ -272,7 +434,12 @@ class App:
         self.button(dialog, "下载并加入图库", run, accent=True).pack(pady=14)
 
     def open_official_site(self) -> None:
-        import webbrowser; webbrowser.open("https://www.yuanqidesk.com/")
+        import webbrowser; webbrowser.open(OFFICIAL_SHOWCASE_URL)
+
+    def open_official_catalog(self, url: str = OFFICIAL_CATALOG_URL) -> None:
+        import webbrowser
+        webbrowser.open(url)
+        self.status.set("已打开元气官方实时资源页；浏览和登录均由官方页面处理。")
 
     def open_settings(self) -> None:
         dialog = tk.Toplevel(self.root); dialog.title("定时切换"); dialog.configure(bg=PANEL); dialog.geometry("360x190")

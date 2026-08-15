@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
+from catalog import IntegrationUnavailable, YuanqiOfficialApiSource
 
 
 class CoreTests(unittest.TestCase):
@@ -17,6 +18,18 @@ class CoreTests(unittest.TestCase):
         for _, url in app.OFFICIAL_FEATURED:
             self.assertTrue(url.startswith("https://"))
             self.assertEqual(Path(url).suffix, ".png")
+
+    def test_official_static_categories_are_https_pages(self):
+        self.assertGreaterEqual(len(app.OFFICIAL_STATIC_CATEGORIES), 10)
+        self.assertTrue(all(url.startswith("https://bizhi.cheetahfun.com/") for _, url in app.OFFICIAL_STATIC_CATEGORIES))
+
+    def test_unconfigured_official_api_never_returns_fake_data(self):
+        source = YuanqiOfficialApiSource()
+        capabilities = source.capabilities()
+        self.assertFalse(capabilities.authorization)
+        self.assertFalse(capabilities.original_download)
+        with self.assertRaises(IntegrationUnavailable):
+            source.list_items("landscape")
 
     def test_config_round_trip(self):
         original = app.CONFIG_PATH
