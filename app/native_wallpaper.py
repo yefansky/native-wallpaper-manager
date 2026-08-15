@@ -418,7 +418,7 @@ class App:
             f"{WECHAT_LOGIN_SURFACE.qr_instruction} → 手机端确认"
         )
         wechat_return = (
-            "统一登录宿主关闭 → 主宿主继续运行 → 官方回调/用户信息刷新 → 会话校验"
+            "统一登录宿主关闭 → SDK IUserInfoChangeListener → 主宿主刷新 → 会话校验"
             if WECHAT_AUTH_RETURN_SURFACE.external_host_closed
             else "等待官方宿主回调"
         )

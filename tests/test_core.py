@@ -100,6 +100,12 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.main_host_survives)
         self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.refresh_requires_official_callback)
         self.assertFalse(WECHAT_AUTH_RETURN_SURFACE.child_exit_is_authentication_proof)
+        self.assertFalse(WECHAT_AUTH_RETURN_SURFACE.main_host_waits_for_child_process)
+        self.assertEqual(
+            WECHAT_AUTH_RETURN_SURFACE.official_listener_interface,
+            "vip_sdk::IUserInfoChangeListener",
+        )
+        self.assertEqual(WECHAT_AUTH_RETURN_SURFACE.observed_main_listener, "KGalleryDlg")
 
     def test_kvipgui_internal_bridge_does_not_authorize_credential_replay(self):
         boundary = KVIPGUI_LOGIN_BRIDGE_BOUNDARY
@@ -201,6 +207,9 @@ class CoreTests(unittest.TestCase):
         auth = YuanqiAuthCoordinator(FakeBackend())
         auth.begin_login()
         auth.select_login_provider(LoginProvider.QQ)
+        observed = auth.observe_official_user_info_change()
+        self.assertEqual(observed.phase, AuthPhase.OFFICIAL_REFRESH_OBSERVED)
+        self.assertFalse(observed.has_session)
         result = auth.callback_on_login(False)
         self.assertEqual(result.phase, AuthPhase.SIGNED_OUT)
         self.assertFalse(result.has_session)

@@ -106,6 +106,9 @@ class WechatAuthReturnSurface:
     main_host_survives: bool = True
     refresh_requires_official_callback: bool = True
     child_exit_is_authentication_proof: bool = False
+    main_host_waits_for_child_process: bool = False
+    official_listener_interface: str = "vip_sdk::IUserInfoChangeListener"
+    observed_main_listener: str = "KGalleryDlg"
 
 
 WECHAT_AUTH_RETURN_SURFACE = WechatAuthReturnSurface()
@@ -174,6 +177,7 @@ class AuthPhase(str, Enum):
     PHONE_SUBMITTING = "phone_submitting"
     QQ_QR_PENDING = "qq_qr_pending"
     QQ_PASSWORD_PENDING = "qq_password_pending"
+    OFFICIAL_REFRESH_OBSERVED = "official_refresh_observed"
     VERIFYING = "verifying"
     AUTHENTICATED = "authenticated"
     EXPIRED = "expired"
@@ -343,6 +347,25 @@ class YuanqiAuthCoordinator:
             "手机认证已提交，等待原生宿主返回登录回调。",
             provider=LoginProvider.PHONE.value,
         )
+        return self._snapshot
+
+    def observe_official_user_info_change(self) -> AuthSnapshot:
+        """记录官方 SDK 监听器信号；该信号本身不能建立会话。"""
+
+        pending_phases = {
+            AuthPhase.WECHAT_QR_PENDING,
+            AuthPhase.PHONE_PENDING,
+            AuthPhase.PHONE_CODE_PENDING,
+            AuthPhase.PHONE_SUBMITTING,
+            AuthPhase.QQ_QR_PENDING,
+            AuthPhase.QQ_PASSWORD_PENDING,
+        }
+        if self.backend.configured() and self._snapshot.phase in pending_phases:
+            self._snapshot = AuthSnapshot(
+                AuthPhase.OFFICIAL_REFRESH_OBSERVED,
+                "官方用户信息监听器已通知；仍需登录回调和服务端会话校验。",
+                provider=self._snapshot.provider,
+            )
         return self._snapshot
 
     def callback_on_login(self, result: bool | Mapping[str, object]) -> AuthSnapshot:

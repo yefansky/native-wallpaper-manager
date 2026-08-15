@@ -98,6 +98,32 @@ Win32 消息导入也完成了归因：`RegisterWindowMessageW` 位于通用
 `broadcastAction` 命令处理器，`isUserLogin` 使用的 `PostMessageW` 是关闭自身窗口，均不能
 当作登录回调 ABI。
 
+## 主宿主的登录后回流 ABI
+
+继续沿 `kwallpaperui.exe` 的 `OpenVipCommand::RunVip` 反向核对，确认启动路径最终调用
+`ShellExecuteW`，只返回是否成功拉起 `kvipgui.exe`；该控制流不保存子进程句柄，也不调用
+`WaitForSingleObject`。因此主宿主不是靠等待登录子进程结束来认定登录成功。
+
+主宿主内存在两套 SDK 通知基础设施：
+
+- `KVipNotifyClient` 创建消息窗口，并注册两个 GUID 命名的 Windows 消息；其中一个无载荷
+  通知直接分发回调，另一个只通过 Global Atom 临时转交两个字符串后立即删除 Atom；
+- `KGalleryDlg` 明确实现 `vip_sdk::IUserInfoChangeListener`。RTTI 显示监听器子对象位于
+  `KGalleryDlg + 1232`，虚表为 `0x717d24`，唯一回调为 `0x4e91d8`；
+- SDK core 虚表 `+108/+112` 由包装函数 `0x4609e2/0x460a08` 成对用于监听器注册和注销；
+  `KGalleryDlg` 初始化/清理路径会把自己的监听器子对象传入；
+- 回调 `0x4e91d8` 引用日志 `KGalleryDlg::OnUserInfoChange Start.`，随后刷新主界面多个账号
+  相关组件。
+
+由此可把微信回流顺序修正为：“统一登录页把结果交给官方会员 SDK → SDK 发布用户信息
+变更 → `KGalleryDlg::OnUserInfoChange` 刷新主界面”。`kvipgui.exe` 退出只是同一流程中的
+窗口生命周期结果，不是登录凭据或成功证明。自研实现可以复刻监听器/状态机形状，但没有
+官方 core 接口、产品身份和服务端校验权时，不能伪造该通知为登录成功。
+
+状态机因此新增 `OFFICIAL_REFRESH_OBSERVED`：它只表示收到用户信息监听器信号，
+`has_session` 仍为假；后续必须收到登录回调并完成用户、设备和服务端会话校验，才进入
+`AUTHENTICATED`。
+
 ## 微信扫码实机追踪结果
 
 账号本人在默认微信页扫码并在手机端确认。非秘密进程快照确认如下顺序：
