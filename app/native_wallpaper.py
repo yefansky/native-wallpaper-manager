@@ -5,8 +5,6 @@ import ctypes
 import json
 import os
 import shutil
-import subprocess
-import sys
 import threading
 import urllib.parse
 import urllib.request
@@ -139,7 +137,7 @@ class App:
         tk.Label(header, text="Windows 原生模式", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
         nav = tk.Frame(header, bg="#f1f3f7"); nav.pack(side="left", padx=36, pady=15)
         self.nav_buttons = {}
-        for key, label in (("wallpaper", "本地壁纸"), ("official", "官方资源"), ("theme", "电脑主题"), ("beauty", "系统美化"), ("components", "组件"), ("mine", "我的")):
+        for key, label in (("wallpaper", "本地壁纸"), ("official", "资源接入"), ("theme", "电脑主题"), ("beauty", "系统美化"), ("components", "组件"), ("mine", "我的")):
             button = tk.Button(nav, text=label, command=lambda name=key: self.show_page(name), relief="flat", cursor="hand2", bd=0,
                                bg="#f1f3f7", fg=TEXT, activebackground=GOLD, font=("Microsoft YaHei UI", 10, "bold"), padx=16, pady=10)
             button.pack(side="left", padx=2); self.nav_buttons[key] = button
@@ -228,41 +226,35 @@ class App:
     def build_official_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG)
         capabilities = self.yuanqi_source.capabilities()
-        self.page_header(page, "元气官方资源", "分类保持单行；资源图片、搜索、分页和详情在下方独立客户端窗口实时显示。")
+        self.page_header(page, "元气资源接入", "只有我们的程序能完成授权、下载静态原图并加入本地资料库，才算接通。")
         notice = tk.Frame(page, bg="#fff7df", highlightbackground="#f1d28a", highlightthickness=1, padx=14, pady=9)
         notice.pack(fill="x", pady=(0, 10))
-        tk.Label(notice, text=f"正式接入状态：{capabilities.reason} 不伪造登录态或会员原图。", bg="#fff7df", fg=PINK,
+        tk.Label(notice, text=f"未接通：{capabilities.reason}", bg="#fff7df", fg=PINK,
                  font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
 
         categories = tk.Frame(page, bg=PANEL, padx=6, pady=7)
         categories.pack(fill="x")
-        for index, (label, url) in enumerate(OFFICIAL_STATIC_CATEGORIES):
-            button = tk.Button(
+        for label, _url in OFFICIAL_STATIC_CATEGORIES:
+            chip = tk.Label(
                 categories,
                 text=label,
-                command=lambda target=url: self.open_embedded_catalog(target),
-                relief="flat",
-                cursor="hand2",
-                bd=0,
-                bg=GOLD if index == 0 else PANEL,
-                fg=TEXT,
-                activebackground="#ffd56d",
+                bg="#f1f3f7",
+                fg=MUTED,
                 font=("Microsoft YaHei UI", 9, "bold"),
                 padx=5,
                 pady=8,
             )
-            button.pack(side="left", fill="x", expand=True, padx=1)
+            chip.pack(side="left", fill="x", expand=True, padx=1)
 
         preview = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=28, pady=28)
         preview.pack(fill="both", expand=True, pady=(12, 0))
-        tk.Label(preview, text="实时官方图库", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w")
-        tk.Label(preview, text="点击上方任一分类，或打开完整图库。新窗口直接显示元气官方页面，资源会随官方持续更新。",
+        tk.Label(preview, text="正式资源适配器尚未可用", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w")
+        tk.Label(preview, text="官网可以浏览缩略图，但下载按钮只会要求安装官方客户端。网页套壳不能下载、收藏或原生应用，所以不作为本客户端功能。",
                  bg=PANEL, fg=MUTED, justify="left", wraplength=760, font=("Microsoft YaHei UI", 11), pady=12).pack(anchor="w")
-        tk.Label(preview, text="客户端本体不依赖元气桌面安装；当前公开网页仍未提供会员账号授权和高清原图 API。",
+        tk.Label(preview, text="待官方提供第三方 OAuth/API 后，这里才会显示账号、真实分类分页、可下载原图和应用按钮。",
                  bg=PANEL, fg=PINK, justify="left", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
         actions = tk.Frame(preview, bg=PANEL); actions.pack(anchor="w", pady=(28, 0))
-        self.button(actions, "在客户端内打开完整图库", lambda: self.open_embedded_catalog(OFFICIAL_CATALOG_URL), accent=True).pack(side="left", padx=(0, 8))
-        self.button(actions, "用系统浏览器打开", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL)).pack(side="left")
+        self.button(actions, "仅在浏览器核验官网", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL)).pack(side="left")
         return page
 
     def build_beauty_page(self) -> tk.Frame:
@@ -463,17 +455,6 @@ class App:
         import webbrowser
         webbrowser.open(url)
         self.status.set("已打开元气官方实时资源页；浏览和登录均由官方页面处理。")
-
-    def open_embedded_catalog(self, url: str = OFFICIAL_CATALOG_URL) -> None:
-        helper = Path(__file__).with_name("official_catalog_view.py")
-        try:
-            subprocess.Popen(
-                [sys.executable, str(helper), url],
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-            self.status.set("已在客户端窗口中打开元气官方实时资源。")
-        except (OSError, ValueError) as exc:
-            messagebox.showerror("无法打开官方资源", str(exc))
 
     def open_settings(self) -> None:
         dialog = tk.Toplevel(self.root); dialog.title("定时切换"); dialog.configure(bg=PANEL); dialog.geometry("360x190")
