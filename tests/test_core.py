@@ -12,6 +12,10 @@ from catalog import IntegrationUnavailable, YuanqiOfficialApiSource
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
+    DEFAULT_LOGIN_PROVIDER,
+    LOGIN_OPTIONS,
+    LoginInteraction,
+    LoginProvider,
     UnavailableYuanqiLoginBackend,
     YuanqiAuthCoordinator,
     YuanqiSession,
@@ -58,6 +62,32 @@ class CoreTests(unittest.TestCase):
         session = YuanqiSession("user-1", "device-1", "do-not-print", "QQ")
         self.assertNotIn("do-not-print", repr(session))
 
+    def test_official_pc_login_surface_matches_observed_options(self):
+        self.assertEqual(DEFAULT_LOGIN_PROVIDER, LoginProvider.WECHAT)
+        self.assertEqual(
+            [(option.provider, option.label) for option in LOGIN_OPTIONS],
+            [
+                (LoginProvider.WECHAT, "微信登录"),
+                (LoginProvider.PHONE, "手机登录"),
+                (LoginProvider.QQ, "QQ"),
+            ],
+        )
+        self.assertEqual(LOGIN_OPTIONS[0].interaction, LoginInteraction.QR_SCAN)
+
+    def test_yuanqi_login_provider_state_transitions(self):
+        class FakeBackend:
+            def configured(self): return True
+            def navigate_to_login(self): pass
+            def get_user_info(self): return {}
+            def get_device_info(self): return {}
+            def verify_session(self, session): return False
+
+        auth = YuanqiAuthCoordinator(FakeBackend())
+        self.assertEqual(auth.begin_login().phase, AuthPhase.QR_PENDING)
+        self.assertEqual(auth.snapshot.provider, LoginProvider.WECHAT.value)
+        self.assertEqual(auth.select_login_provider(LoginProvider.PHONE).phase, AuthPhase.PHONE_PENDING)
+        self.assertEqual(auth.select_login_provider(LoginProvider.QQ).phase, AuthPhase.QQ_PENDING)
+
     def test_yuanqi_login_requires_callback_then_server_verification(self):
         class FakeBackend:
             def configured(self): return True
@@ -68,7 +98,7 @@ class CoreTests(unittest.TestCase):
 
         backend = FakeBackend()
         auth = YuanqiAuthCoordinator(backend)
-        self.assertEqual(auth.begin_login().phase, AuthPhase.WAITING_FOR_USER)
+        self.assertEqual(auth.begin_login().phase, AuthPhase.QR_PENDING)
         self.assertTrue(backend.opened)
         result = auth.callback_on_login({"ret": 0})
         self.assertEqual(result.phase, AuthPhase.AUTHENTICATED)

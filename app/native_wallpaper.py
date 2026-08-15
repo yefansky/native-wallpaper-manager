@@ -19,7 +19,7 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageOps, ImageTk
 
 from catalog import YuanqiOfficialApiSource
-from yuanqi_auth import BRIDGE_METHODS, UnavailableYuanqiLoginBackend, YuanqiAuthCoordinator
+from yuanqi_auth import BRIDGE_METHODS, LOGIN_OPTIONS, UnavailableYuanqiLoginBackend, YuanqiAuthCoordinator
 
 APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
 WALLPAPER_DIR = APP_DIR / "wallpapers"
@@ -397,11 +397,13 @@ class App:
             f"{method.channel} → {method.callback or '无回调'}"
             for method in BRIDGE_METHODS
         )
+        options = " / ".join(option.label for option in LOGIN_OPTIONS)
         messagebox.showinfo(
             "元气电脑版登录桥自检",
             "已复刻并测试的原生桥契约：\n\n"
             f"{methods}\n\n"
-            "状态流：拉起登录 → 用户本人认证 → 登录回调 → 用户/设备信息 → 服务端校验。\n\n"
+            f"实机登录入口：{options}（默认微信二维码）。\n\n"
+            "状态流：拉起登录 → 选择入口/本人认证 → 登录回调 → 用户/设备信息 → 服务端校验。\n\n"
             f"当前：{self.yuanqi_auth.snapshot.message}",
         )
 

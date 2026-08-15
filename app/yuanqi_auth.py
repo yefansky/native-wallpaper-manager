@@ -24,10 +24,43 @@ LOGIN = BridgeMethod("navigate2Login", "callbackOnLogin")
 BRIDGE_METHODS = (LOGIN, GET_USER_INFO, GET_DEVICE_INFO)
 
 
+class LoginProvider(str, Enum):
+    WECHAT = "wechat"
+    PHONE = "phone"
+    QQ = "qq"
+
+
+class LoginInteraction(str, Enum):
+    QR_SCAN = "qr_scan"
+    NATIVE_FORM = "native_form"
+    NATIVE_HANDOFF = "native_handoff"
+
+
+@dataclass(frozen=True)
+class LoginOption:
+    """官方电脑版快速登录窗中可见的认证入口。"""
+
+    provider: LoginProvider
+    label: str
+    interaction: LoginInteraction
+    instruction: str
+
+
+LOGIN_OPTIONS = (
+    LoginOption(LoginProvider.WECHAT, "微信登录", LoginInteraction.QR_SCAN, "微信扫一扫登录"),
+    LoginOption(LoginProvider.PHONE, "手机登录", LoginInteraction.NATIVE_FORM, "由原生宿主显示手机登录表单"),
+    LoginOption(LoginProvider.QQ, "QQ", LoginInteraction.NATIVE_HANDOFF, "由原生宿主继续 QQ 认证"),
+)
+DEFAULT_LOGIN_PROVIDER = LoginProvider.WECHAT
+
+
 class AuthPhase(str, Enum):
     UNAVAILABLE = "unavailable"
     SIGNED_OUT = "signed_out"
     WAITING_FOR_USER = "waiting_for_user"
+    QR_PENDING = "qr_pending"
+    PHONE_PENDING = "phone_pending"
+    QQ_PENDING = "qq_pending"
     VERIFYING = "verifying"
     AUTHENTICATED = "authenticated"
     EXPIRED = "expired"
@@ -109,7 +142,36 @@ class YuanqiAuthCoordinator:
         if not self.backend.configured():
             return self._snapshot
         self.backend.navigate_to_login()
-        self._snapshot = AuthSnapshot(AuthPhase.WAITING_FOR_USER, "已拉起原生登录窗，等待用户完成认证。")
+        self._snapshot = AuthSnapshot(
+            AuthPhase.QR_PENDING,
+            "已拉起原生登录窗，默认等待用户使用微信扫码并在手机端确认。",
+            provider=DEFAULT_LOGIN_PROVIDER.value,
+        )
+        return self._snapshot
+
+    def select_login_provider(self, provider: LoginProvider) -> AuthSnapshot:
+        """记录原生登录窗当前入口；认证交互仍必须由用户本人完成。"""
+
+        if not self.backend.configured():
+            return self._snapshot
+        if provider is LoginProvider.WECHAT:
+            self._snapshot = AuthSnapshot(
+                AuthPhase.QR_PENDING,
+                "等待用户使用微信扫码并在手机端确认。",
+                provider=provider.value,
+            )
+        elif provider is LoginProvider.PHONE:
+            self._snapshot = AuthSnapshot(
+                AuthPhase.PHONE_PENDING,
+                "等待用户在原生手机登录表单中完成认证。",
+                provider=provider.value,
+            )
+        else:
+            self._snapshot = AuthSnapshot(
+                AuthPhase.QQ_PENDING,
+                "等待用户通过原生 QQ 入口完成认证。",
+                provider=provider.value,
+            )
         return self._snapshot
 
     def callback_on_login(self, result: bool | Mapping[str, object]) -> AuthSnapshot:

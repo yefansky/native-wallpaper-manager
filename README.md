@@ -45,7 +45,7 @@ python app/native_wallpaper.py
 
 `app/catalog.py` 定义了认证、分类、分页、搜索、预览和原图下载的数据源契约。元气正式适配器在缺少官方 OAuth/API 配置时会显式拒绝返回数据，不会用网页套壳或模拟响应冒充接通。
 
-`app/yuanqi_auth.py` 固化 `navigate2Login`、`callbackOnLogin`、`getUserInfo` 和 `getDeviceInfo` 等官方 H5 原生桥契约。它只实现安全的内存状态机，不读取官方客户端存储，也不持久化登录令牌。
+`app/yuanqi_auth.py` 固化 `navigate2Login`、`callbackOnLogin`、`getUserInfo` 和 `getDeviceInfo` 等官方 H5 原生桥契约，并按实机登录窗建模微信二维码（默认）、手机登录和 QQ 三个入口。它只实现安全的内存状态机，不读取官方客户端存储，也不持久化登录令牌。
 
 “资源接入”页不再显示不可点击的假分类。当前可执行动作是迁移本机已有静态缓存；联网账号、持续更新与会员原图仍必须等本客户端取得受支持的正式授权后才显示。
 
