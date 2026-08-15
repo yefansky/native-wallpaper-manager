@@ -54,12 +54,29 @@ LOGIN_OPTIONS = (
 DEFAULT_LOGIN_PROVIDER = LoginProvider.WECHAT
 
 
+@dataclass(frozen=True)
+class PhoneLoginSurface:
+    """官方电脑版手机登录标签中实机可见的控件。"""
+
+    phone_placeholder: str = "输入手机号"
+    code_placeholder: str = "输入验证码"
+    request_code_label: str = "获取验证码"
+    submit_label: str = "登录"
+    consent_notice: str = "登录即同意《用户协议》《隐私政策》"
+    requires_consent_checkbox: bool = False
+
+
+PHONE_LOGIN_SURFACE = PhoneLoginSurface()
+
+
 class AuthPhase(str, Enum):
     UNAVAILABLE = "unavailable"
     SIGNED_OUT = "signed_out"
     WAITING_FOR_USER = "waiting_for_user"
     QR_PENDING = "qr_pending"
     PHONE_PENDING = "phone_pending"
+    PHONE_CODE_PENDING = "phone_code_pending"
+    PHONE_SUBMITTING = "phone_submitting"
     QQ_PENDING = "qq_pending"
     VERIFYING = "verifying"
     AUTHENTICATED = "authenticated"
@@ -94,6 +111,8 @@ class YuanqiLoginBackend(Protocol):
 
     def configured(self) -> bool: ...
     def navigate_to_login(self) -> None: ...
+    def request_phone_code(self, phone_number: str) -> None: ...
+    def submit_phone_login(self, phone_number: str, verification_code: str) -> None: ...
     def get_user_info(self) -> Mapping[str, object]: ...
     def get_device_info(self) -> Mapping[str, object]: ...
     def verify_session(self, session: YuanqiSession) -> bool: ...
@@ -111,6 +130,12 @@ class UnavailableYuanqiLoginBackend:
         raise RuntimeError(self.REASON)
 
     def navigate_to_login(self) -> None:
+        self._unavailable()
+
+    def request_phone_code(self, phone_number: str) -> None:
+        self._unavailable()
+
+    def submit_phone_login(self, phone_number: str, verification_code: str) -> None:
         self._unavailable()
 
     def get_user_info(self) -> Mapping[str, object]:
@@ -172,6 +197,40 @@ class YuanqiAuthCoordinator:
                 "等待用户通过原生 QQ 入口完成认证。",
                 provider=provider.value,
             )
+        return self._snapshot
+
+    def request_phone_code(self, phone_number: str) -> AuthSnapshot:
+        """请求短信验证码；手机号只瞬时传给后端，不进入状态对象。"""
+
+        if not self.backend.configured():
+            return self._snapshot
+        if self._snapshot.provider != LoginProvider.PHONE.value:
+            raise RuntimeError("必须先进入手机登录页。")
+        if not phone_number.strip():
+            raise ValueError("手机号不能为空。")
+        self.backend.request_phone_code(phone_number)
+        self._snapshot = AuthSnapshot(
+            AuthPhase.PHONE_CODE_PENDING,
+            "验证码请求已提交，等待用户输入收到的验证码。",
+            provider=LoginProvider.PHONE.value,
+        )
+        return self._snapshot
+
+    def submit_phone_login(self, phone_number: str, verification_code: str) -> AuthSnapshot:
+        """提交手机认证；手机号和验证码均不保存在协调器中。"""
+
+        if not self.backend.configured():
+            return self._snapshot
+        if self._snapshot.provider != LoginProvider.PHONE.value:
+            raise RuntimeError("必须先进入手机登录页。")
+        if not phone_number.strip() or not verification_code.strip():
+            raise ValueError("手机号和验证码不能为空。")
+        self.backend.submit_phone_login(phone_number, verification_code)
+        self._snapshot = AuthSnapshot(
+            AuthPhase.PHONE_SUBMITTING,
+            "手机认证已提交，等待原生宿主返回登录回调。",
+            provider=LoginProvider.PHONE.value,
+        )
         return self._snapshot
 
     def callback_on_login(self, result: bool | Mapping[str, object]) -> AuthSnapshot:

@@ -14,6 +14,7 @@ from yuanqi_auth import (
     BRIDGE_METHODS,
     DEFAULT_LOGIN_PROVIDER,
     LOGIN_OPTIONS,
+    PHONE_LOGIN_SURFACE,
     LoginInteraction,
     LoginProvider,
     UnavailableYuanqiLoginBackend,
@@ -74,10 +75,19 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(LOGIN_OPTIONS[0].interaction, LoginInteraction.QR_SCAN)
 
+    def test_official_phone_login_surface_matches_observed_controls(self):
+        self.assertEqual(PHONE_LOGIN_SURFACE.phone_placeholder, "输入手机号")
+        self.assertEqual(PHONE_LOGIN_SURFACE.code_placeholder, "输入验证码")
+        self.assertEqual(PHONE_LOGIN_SURFACE.request_code_label, "获取验证码")
+        self.assertEqual(PHONE_LOGIN_SURFACE.submit_label, "登录")
+        self.assertFalse(PHONE_LOGIN_SURFACE.requires_consent_checkbox)
+
     def test_yuanqi_login_provider_state_transitions(self):
         class FakeBackend:
             def configured(self): return True
             def navigate_to_login(self): pass
+            def request_phone_code(self, phone_number): pass
+            def submit_phone_login(self, phone_number, verification_code): pass
             def get_user_info(self): return {}
             def get_device_info(self): return {}
             def verify_session(self, session): return False
@@ -88,10 +98,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(auth.select_login_provider(LoginProvider.PHONE).phase, AuthPhase.PHONE_PENDING)
         self.assertEqual(auth.select_login_provider(LoginProvider.QQ).phase, AuthPhase.QQ_PENDING)
 
+    def test_phone_code_flow_does_not_store_phone_or_code_in_snapshot(self):
+        class FakeBackend:
+            def configured(self): return True
+            def navigate_to_login(self): pass
+            def request_phone_code(self, phone_number): self.code_requested = True
+            def submit_phone_login(self, phone_number, verification_code): self.submitted = True
+            def get_user_info(self): return {}
+            def get_device_info(self): return {}
+            def verify_session(self, session): return False
+
+        backend = FakeBackend()
+        auth = YuanqiAuthCoordinator(backend)
+        auth.begin_login()
+        auth.select_login_provider(LoginProvider.PHONE)
+        snapshot = auth.request_phone_code("13800000000")
+        self.assertEqual(snapshot.phase, AuthPhase.PHONE_CODE_PENDING)
+        self.assertTrue(backend.code_requested)
+        snapshot = auth.submit_phone_login("13800000000", "123456")
+        self.assertEqual(snapshot.phase, AuthPhase.PHONE_SUBMITTING)
+        self.assertTrue(backend.submitted)
+        self.assertNotIn("13800000000", repr(snapshot))
+        self.assertNotIn("123456", repr(snapshot))
+
     def test_yuanqi_login_requires_callback_then_server_verification(self):
         class FakeBackend:
             def configured(self): return True
             def navigate_to_login(self): self.opened = True
+            def request_phone_code(self, phone_number): pass
+            def submit_phone_login(self, phone_number, verification_code): pass
             def get_user_info(self): return {"uid": "user-1", "token": "session-secret", "provider": "QQ"}
             def get_device_info(self): return {"deviceId": "device-1"}
             def verify_session(self, session): return session.complete
