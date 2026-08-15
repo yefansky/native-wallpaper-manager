@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import threading
 import urllib.parse
 import urllib.request
 import uuid
+import winreg
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import tkinter as tk
@@ -17,6 +19,7 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageOps, ImageTk
 
 from catalog import YuanqiOfficialApiSource
+from yuanqi_auth import BRIDGE_METHODS, UnavailableYuanqiLoginBackend, YuanqiAuthCoordinator
 
 APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
 WALLPAPER_DIR = APP_DIR / "wallpapers"
@@ -33,6 +36,13 @@ OFFICIAL_FEATURED = (
 OFFICIAL_SHOWCASE_URL = "https://www.yuanqidesk.com/"
 OFFICIAL_CATALOG_URL = "https://bizhi.cheetahfun.com/"
 OFFICIAL_FEATURED_SOURCE = "元气官网首页公开展示"
+LEGACY_FEATURED_SOURCES = {"元气官网公开精选", "元气官网精选", OFFICIAL_FEATURED_SOURCE}
+YUANQI_CACHE_SOURCE = "本机元气静态缓存（已独立复制）"
+DEFAULT_YUANQI_CACHE_DIRS = (
+    Path.home() / "AppData" / "Roaming" / "kdesk" / "data" / "wallpaper" / "img",
+    Path("G:/元气壁纸缓存/img"),
+    Path("G:/元气壁纸缓存/khealtheye/wallpaper"),
+)
 OFFICIAL_STATIC_CATEGORIES = (
     ("全部静态", "https://bizhi.cheetahfun.com/dn/j/"),
     ("4K", "https://bizhi.cheetahfun.com/tag_93_07530310f9c29fbc88118c6eb8bb2047}/"),
@@ -51,6 +61,7 @@ OFFICIAL_STATIC_CATEGORIES = (
 SPI_SETDESKWALLPAPER = 20
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
+LOCAL_PAGE_SIZE = 12
 BG, PANEL, TEXT, MUTED, GOLD, PINK, LINE = "#f5f6fa", "#ffffff", "#1e2233", "#81879a", "#f4b734", "#fa6d9b", "#e9ebf1"
 
 
@@ -69,7 +80,7 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         return {"items": [], "interval_minutes": 0, "last_applied": ""}
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return normalize_config(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError):
         return {"items": [], "interval_minutes": 0, "last_applied": ""}
 
@@ -79,13 +90,121 @@ def save_config(config: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def normalize_config(config: dict) -> dict:
+    """迁移旧版来源名称，并只对官网 5 张公开样图去重。"""
+    normalized = dict(config) if isinstance(config, dict) else {}
+    normalized_items: list[dict] = []
+    featured_titles = {title for title, _url in OFFICIAL_FEATURED}
+    seen_featured: set[str] = set()
+    id_aliases: dict[str, str] = {}
+    for raw in normalized.get("items", []):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        title = str(item.get("title", ""))
+        source = str(item.get("source", "本地导入"))
+        if title in featured_titles and source in LEGACY_FEATURED_SOURCES:
+            item["source"] = OFFICIAL_FEATURED_SOURCE
+            if title in seen_featured:
+                if item.get("id") and normalized_items:
+                    kept = next((entry for entry in normalized_items if entry.get("title") == title and entry.get("source") == OFFICIAL_FEATURED_SOURCE), None)
+                    if kept and kept.get("id"):
+                        id_aliases[str(item["id"])] = str(kept["id"])
+                continue
+            seen_featured.add(title)
+        normalized_items.append(item)
+    normalized["items"] = normalized_items
+    last_applied = str(normalized.get("last_applied", ""))
+    if last_applied in id_aliases:
+        normalized["last_applied"] = id_aliases[last_applied]
+    normalized.setdefault("interval_minutes", 0)
+    normalized.setdefault("last_applied", "")
+    return normalized
+
+
+def current_native_wallpaper() -> Path:
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as key:
+        value, _kind = winreg.QueryValueEx(key, "WallPaper")
+    return Path(value)
+
+
+def same_windows_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_valid_static_image(path: Path) -> bool:
+    if path.suffix.lower() not in IMAGE_EXTENSIONS or not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        with Image.open(path) as image:
+            if getattr(image, "is_animated", False) and getattr(image, "n_frames", 1) > 1:
+                return False
+            image.verify()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def discover_yuanqi_cache_images(roots: tuple[Path, ...] | list[Path]) -> list[Path]:
+    discovered: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for candidate in root.rglob("*"):
+            if not is_valid_static_image(candidate):
+                continue
+            fingerprint = file_digest(candidate)
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                discovered.append(candidate)
+    return discovered
+
+
+def copy_yuanqi_cache_images(candidates: list[Path], existing_paths: list[Path]) -> list[Wallpaper]:
+    WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
+    existing_hashes = {file_digest(path) for path in existing_paths if is_valid_static_image(path)}
+    imported: list[Wallpaper] = []
+    for candidate in candidates:
+        fingerprint = file_digest(candidate)
+        if fingerprint in existing_hashes:
+            continue
+        suffix = candidate.suffix.lower()
+        target = WALLPAPER_DIR / f"{uuid.uuid4().hex}{suffix}"
+        shutil.copy2(candidate, target)
+        try:
+            with Image.open(target) as image:
+                width, height = image.size
+        except OSError:
+            target.unlink(missing_ok=True)
+            continue
+        short_id = fingerprint[:8]
+        imported.append(Wallpaper(uuid.uuid4().hex, str(target), f"元气静态壁纸 {width}×{height} · {short_id}", source=YUANQI_CACHE_SOURCE))
+        existing_hashes.add(fingerprint)
+    return imported
+
+
 def set_native_wallpaper(path: Path) -> None:
+    path = path.resolve()
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
         raise ValueError("Windows 原生壁纸仅支持 BMP/JPG/PNG 图片")
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("壁纸文件不存在或为空")
     if not ctypes.windll.user32.SystemParametersInfoW(
-        SPI_SETDESKWALLPAPER, 0, str(path), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+        SPI_SETDESKWALLPAPER, 0, str(path), SPIF_UPDATEINIFILE
     ):
         raise ctypes.WinError()
+    applied = current_native_wallpaper()
+    if not same_windows_path(applied, path):
+        raise OSError(f"Windows 未确认壁纸变更，当前仍为：{applied}")
 
 
 def download_static_image(url: str, title: str, source: str) -> Wallpaper:
@@ -100,6 +219,10 @@ def download_static_image(url: str, title: str, source: str) -> Wallpaper:
             if not response.headers.get_content_type().startswith("image/"):
                 raise ValueError("服务器没有返回图片内容")
             shutil.copyfileobj(response, output)
+        if target.stat().st_size == 0:
+            raise ValueError("下载得到空文件")
+        with Image.open(target) as downloaded:
+            downloaded.verify()
     except Exception:
         target.unlink(missing_ok=True)
         raise
@@ -115,11 +238,13 @@ class App:
         self.root.configure(bg=BG)
         self.config = load_config()
         self.yuanqi_source = YuanqiOfficialApiSource()
+        self.yuanqi_auth = YuanqiAuthCoordinator(UnavailableYuanqiLoginBackend())
         self.items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
         self.filter_favorites = False
+        self.local_page = 0
         self.selected_id = self.config.get("last_applied") or (self.items[0].id if self.items else None)
         self.timer: threading.Timer | None = None
-        self.status = tk.StringVar(value="Windows 原生壁纸模式：不会覆盖桌面或隐藏图标。")
+        self.status = tk.StringVar(value="本地 Windows 原生功能已就绪；元气账号尚未接入本客户端。")
         self.photo_refs: list[ImageTk.PhotoImage] = []
         self._build()
         self.refresh()
@@ -151,7 +276,7 @@ class App:
         self.favorite_button = self.button(sidebar, "我的收藏", self.show_favorites, width=13); self.favorite_button.pack(padx=16, pady=3)
         tk.Frame(sidebar, bg=LINE, height=1).pack(fill="x", padx=18, pady=20)
         tk.Label(sidebar, text="资源来源", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=18)
-        tk.Label(sidebar, text="· 本地导入\n· 元气官网首页公开展示\n· 已授权图片直链", justify="left", bg=PANEL, fg=TEXT,
+        tk.Label(sidebar, text="· 本地导入\n· 官网 5 张公开样图\n· 已授权图片直链", justify="left", bg=PANEL, fg=TEXT,
                  font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w", padx=18)
         self.button(sidebar, "打开元气官网", self.open_official_site, width=13).pack(side="bottom", pady=18)
 
@@ -167,11 +292,15 @@ class App:
         self.favorite_action = self.button(detail, "收藏这张", self.toggle_selected_favorite); self.favorite_action.pack(anchor="w")
 
         gallery_header = tk.Frame(main, bg=BG); gallery_header.pack(fill="x", pady=(18, 8))
-        tk.Label(gallery_header, text="壁纸图库", bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(side="left")
+        tk.Label(gallery_header, text="本地壁纸库", bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(side="left")
         self.count_label = tk.Label(gallery_header, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9)); self.count_label.pack(side="left", padx=10)
         self.button(gallery_header, "导入", self.import_images).pack(side="right", padx=3)
         self.button(gallery_header, "直链下载", self.download_url).pack(side="right", padx=3)
-        self.button(gallery_header, "同步精选", self.sync_official_featured).pack(side="right", padx=3)
+        self.button(gallery_header, "同步 5 张公开样图", self.sync_official_featured).pack(side="right", padx=3)
+        self.button(gallery_header, "下一页", self.next_local_page).pack(side="right", padx=(12, 3))
+        self.local_page_label = tk.Label(gallery_header, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9))
+        self.local_page_label.pack(side="right", padx=5)
+        self.button(gallery_header, "上一页", self.previous_local_page).pack(side="right", padx=3)
         self.gallery_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(main, orient="vertical", command=self.gallery_canvas.yview)
         self.gallery_canvas.configure(yscrollcommand=scrollbar.set)
@@ -226,36 +355,55 @@ class App:
     def build_official_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG)
         capabilities = self.yuanqi_source.capabilities()
-        self.page_header(page, "元气资源接入", "只有我们的程序能完成授权、下载静态原图并加入本地资料库，才算接通。")
+        self.page_header(page, "元气资源", "这里仅显示真正可执行的动作；不再用不可点击的分类标签冒充功能。")
         notice = tk.Frame(page, bg="#fff7df", highlightbackground="#f1d28a", highlightthickness=1, padx=14, pady=9)
         notice.pack(fill="x", pady=(0, 10))
-        tk.Label(notice, text=f"未接通：{capabilities.reason}", bg="#fff7df", fg=PINK,
+        tk.Label(notice, text=f"联网账号未接通：{capabilities.reason}", bg="#fff7df", fg=PINK,
                  font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        tk.Label(notice, text="官方元气客户端已经登录 ≠ 本客户端已经登录", bg="#fff7df", fg=TEXT,
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", pady=(4, 0))
 
-        categories = tk.Frame(page, bg=PANEL, padx=6, pady=7)
-        categories.pack(fill="x")
-        for label, _url in OFFICIAL_STATIC_CATEGORIES:
-            chip = tk.Label(
-                categories,
-                text=label,
-                bg="#f1f3f7",
-                fg=MUTED,
-                font=("Microsoft YaHei UI", 9, "bold"),
-                padx=5,
-                pady=8,
-            )
-            chip.pack(side="left", fill="x", expand=True, padx=1)
+        content = tk.Frame(page, bg=BG)
+        content.pack(fill="both", expand=True, pady=(8, 0))
+        migrate = tk.Frame(content, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=26, pady=24)
+        migrate.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        tk.Label(migrate, text="迁移本机已有元气静态壁纸", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
+        tk.Label(migrate, text="扫描元气已经下载到本机的静态图片，验证图片有效性并复制进桌面画廊自己的目录。复制完成后不依赖官方客户端。",
+                 bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 10), pady=10).pack(anchor="w")
+        migrated_count = sum(item.source == YUANQI_CACHE_SOURCE for item in self.items)
+        cache_text = f"本地资料库已有 {migrated_count} 张迁移图片" if migrated_count else "尚未扫描"
+        self.cache_status = tk.Label(migrate, text=cache_text, bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold"))
+        self.cache_status.pack(anchor="w", pady=(4, 16))
+        migrate_actions = tk.Frame(migrate, bg=PANEL); migrate_actions.pack(anchor="w")
+        self.button(migrate_actions, "扫描并迁移", self.import_detected_yuanqi_cache, accent=True).pack(side="left", padx=(0, 8))
+        self.button(migrate_actions, "选择其他缓存目录", self.choose_yuanqi_cache_directory).pack(side="left")
 
-        preview = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=28, pady=28)
-        preview.pack(fill="both", expand=True, pady=(12, 0))
-        tk.Label(preview, text="正式资源适配器尚未可用", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w")
-        tk.Label(preview, text="官网可以浏览缩略图，但下载按钮只会要求安装官方客户端。网页套壳不能下载、收藏或原生应用，所以不作为本客户端功能。",
-                 bg=PANEL, fg=MUTED, justify="left", wraplength=760, font=("Microsoft YaHei UI", 11), pady=12).pack(anchor="w")
-        tk.Label(preview, text="待官方提供第三方 OAuth/API 后，这里才会显示账号、真实分类分页、可下载原图和应用按钮。",
-                 bg=PANEL, fg=PINK, justify="left", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        actions = tk.Frame(preview, bg=PANEL); actions.pack(anchor="w", pady=(28, 0))
-        self.button(actions, "仅在浏览器核验官网", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL)).pack(side="left")
+        online = tk.Frame(content, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=26, pady=24)
+        online.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        tk.Label(online, text="电脑版登录宿主", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
+        tk.Label(online, text="已复刻 navigate2Login → callbackOnLogin → 用户/设备信息 → 服务端校验的状态机。",
+                 bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 10), pady=10).pack(anchor="w")
+        tk.Label(online, text=f"当前状态：{self.yuanqi_auth.snapshot.message}", bg=PANEL, fg=PINK,
+                 justify="left", wraplength=500, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        tk.Label(online, text="不会复用官方客户端令牌；真实登录仍需元气给本客户端签发身份和授权回调。",
+                 bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w")
+        online_actions = tk.Frame(online, bg=PANEL); online_actions.pack(anchor="w", pady=(10, 0))
+        self.button(online_actions, "查看桥接自检", self.show_yuanqi_auth_status, accent=True).pack(side="left", padx=(0, 8))
+        self.button(online_actions, "在浏览器核验官网", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL)).pack(side="left")
         return page
+
+    def show_yuanqi_auth_status(self) -> None:
+        methods = "\n".join(
+            f"{method.channel} → {method.callback or '无回调'}"
+            for method in BRIDGE_METHODS
+        )
+        messagebox.showinfo(
+            "元气电脑版登录桥自检",
+            "已复刻并测试的原生桥契约：\n\n"
+            f"{methods}\n\n"
+            "状态流：拉起登录 → 用户本人认证 → 登录回调 → 用户/设备信息 → 服务端校验。\n\n"
+            f"当前：{self.yuanqi_auth.snapshot.message}",
+        )
 
     def build_beauty_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG); self.page_header(page, "系统美化", "只进入 Windows 原生设置，不注入任务栏、不覆盖桌面。")
@@ -307,9 +455,14 @@ class App:
         self.refresh()
 
     def refresh(self) -> None:
-        items = self.visible_items()
-        if self.selected_id not in {item.id for item in self.items}:
-            self.selected_id = items[0].id if items else None
+        filtered_items = self.visible_items()
+        filtered_ids = {item.id for item in filtered_items}
+        if self.selected_id not in filtered_ids:
+            self.selected_id = filtered_items[0].id if filtered_items else None
+        page_count = max(1, (len(filtered_items) + LOCAL_PAGE_SIZE - 1) // LOCAL_PAGE_SIZE)
+        self.local_page = min(max(self.local_page, 0), page_count - 1)
+        start = self.local_page * LOCAL_PAGE_SIZE
+        items = filtered_items[start:start + LOCAL_PAGE_SIZE]
         self.photo_refs.clear()
         for child in self.gallery.winfo_children(): child.destroy()
         for index, item in enumerate(items):
@@ -325,7 +478,8 @@ class App:
             meta = tk.Label(card, text=("★ 收藏 · " if item.favorite else "") + item.source, bg=PANEL, fg=MUTED, anchor="w", cursor="hand2", font=("Microsoft YaHei UI", 8), pady=7)
             meta.pack(fill="x", padx=9)
             for widget in (card, picture, title, meta): widget.bind("<Button-1>", lambda _event, current=item: self.select(current))
-        self.count_label.configure(text=f"{len(items)} 张静态壁纸")
+        self.count_label.configure(text=f"{len(filtered_items)} 张静态壁纸")
+        self.local_page_label.configure(text=f"第 {self.local_page + 1} / {page_count} 页")
         item = self.selected()
         if item:
             photo = self.image_for(Path(item.path), (470, 248)); self.photo_refs.append(photo)
@@ -342,9 +496,21 @@ class App:
         self.all_button.configure(bg="#fff3cf" if not self.filter_favorites else "#f1f3f8")
         self.favorite_button.configure(bg="#fff3cf" if self.filter_favorites else "#f1f3f8")
         self.persist()
+        self.root.after_idle(lambda: self.gallery_canvas.yview_moveto(0))
 
     def show_all(self) -> None:
-        self.filter_favorites = False; self.refresh()
+        self.filter_favorites = False; self.local_page = 0; self.refresh()
+
+    def previous_local_page(self) -> None:
+        if self.local_page > 0:
+            self.local_page -= 1
+            self.refresh()
+
+    def next_local_page(self) -> None:
+        page_count = max(1, (len(self.visible_items()) + LOCAL_PAGE_SIZE - 1) // LOCAL_PAGE_SIZE)
+        if self.local_page + 1 < page_count:
+            self.local_page += 1
+            self.refresh()
 
     def refresh_theme_preview(self) -> None:
         item = self.selected()
@@ -393,15 +559,50 @@ class App:
 
     def refresh_mine_summary(self) -> None:
         favorites = sum(item.favorite for item in self.items)
-        self.mine_summary.configure(text=f"本地资料库\n\n{len(self.items)} 张静态壁纸\n{favorites} 张收藏\n\n主题文件\n{self.theme_path()}\n\n资源全部存放在本机，不保存元气账号 Cookie 或令牌。")
+        self.mine_summary.configure(text=f"本地资料库\n\n{len(self.items)} 张静态壁纸\n{favorites} 张收藏\n\n元气账号\n本客户端尚未接入\n\n主题文件\n{self.theme_path()}\n\n资源全部存放在本机，不保存元气账号 Cookie 或令牌。")
 
     def show_favorites(self) -> None:
-        self.filter_favorites = True; self.refresh()
+        self.filter_favorites = True; self.local_page = 0; self.refresh()
 
     def add_file(self, source: Path, source_name: str = "本地导入") -> None:
         if source.suffix.lower() not in IMAGE_EXTENSIONS: raise ValueError("只接受 BMP、JPG、JPEG、PNG 静态图片")
         target = WALLPAPER_DIR / f"{uuid.uuid4().hex}{source.suffix.lower()}"; shutil.copy2(source, target)
         self.items.append(Wallpaper(uuid.uuid4().hex, str(target), source.stem, source=source_name))
+
+    def import_yuanqi_cache_roots(self, roots: list[Path]) -> None:
+        self.cache_status.configure(text="正在扫描并复制，请稍候……")
+        self.status.set("正在迁移本机元气静态缓存……")
+        existing_paths = [Path(item.path) for item in self.items]
+
+        def work() -> None:
+            try:
+                candidates = discover_yuanqi_cache_images(roots)
+                imported = copy_yuanqi_cache_images(candidates, existing_paths)
+                self.root.after(0, lambda: finish(candidates, imported, None))
+            except (OSError, ValueError) as exc:
+                self.root.after(0, lambda error=exc: finish([], [], error))
+
+        def finish(candidates: list[Path], imported: list[Wallpaper], error: Exception | None) -> None:
+            if error:
+                self.cache_status.configure(text="迁移失败")
+                messagebox.showerror("迁移失败", str(error))
+                return
+            self.items.extend(imported)
+            if imported:
+                self.selected_id = imported[0].id
+            self.refresh()
+            self.cache_status.configure(text=f"发现 {len(candidates)} 张有效静态图，本次新增 {len(imported)} 张")
+            self.status.set(f"已把 {len(imported)} 张元气静态缓存独立复制到本地资料库。")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def import_detected_yuanqi_cache(self) -> None:
+        self.import_yuanqi_cache_roots(list(DEFAULT_YUANQI_CACHE_DIRS))
+
+    def choose_yuanqi_cache_directory(self) -> None:
+        selected = filedialog.askdirectory(title="选择元气静态壁纸缓存目录")
+        if selected:
+            self.import_yuanqi_cache_roots([Path(selected)])
 
     def import_images(self) -> None:
         paths = filedialog.askopenfilenames(title="选择静态壁纸", filetypes=[("图片", "*.bmp *.jpg *.jpeg *.png")])
@@ -418,16 +619,35 @@ class App:
                 if (title, OFFICIAL_FEATURED_SOURCE) not in existing:
                     self.items.append(download_static_image(url, title, OFFICIAL_FEATURED_SOURCE)); added += 1
             if self.items: self.selected_id = self.items[-1].id
-            self.refresh(); self.status.set("官网精选已是最新。" if not added else f"已同步 {added} 张官网公开精选。")
+            self.refresh(); self.status.set("5 张官网公开样图已是最新。" if not added else f"已同步 {added} 张官网公开样图；这不代表账号资源已接入。")
         except (OSError, ValueError) as exc: messagebox.showerror("同步失败", str(exc))
 
     def apply_selected(self) -> None:
         item = self.selected()
-        if not item: return
-        try:
-            set_native_wallpaper(Path(item.path)); self.config["last_applied"] = item.id; self.persist()
-            self.status.set(f"已用 Windows 原生机制应用：{item.title}")
-        except (OSError, ValueError) as exc: messagebox.showerror("应用失败", str(exc))
+        if not item:
+            return
+        item_id, item_title, item_path = item.id, item.title, Path(item.path)
+        self.apply_button.configure(state="disabled", text="正在应用……")
+        self.status.set(f"正在交给 Windows 应用：{item_title}")
+
+        def work() -> None:
+            try:
+                set_native_wallpaper(item_path)
+                self.root.after(0, lambda: finish(None))
+            except (OSError, ValueError) as exc:
+                self.root.after(0, lambda error=exc: finish(error))
+
+        def finish(error: Exception | None) -> None:
+            self.apply_button.configure(state="normal", text="应用为壁纸")
+            if error:
+                self.status.set(f"Windows 未确认壁纸变更：{item_title}")
+                messagebox.showerror("应用失败", str(error))
+                return
+            self.config["last_applied"] = item_id
+            self.persist()
+            self.status.set(f"已由 Windows 注册表复核应用成功：{item_title}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle_selected_favorite(self) -> None:
         item = self.selected()
@@ -454,7 +674,7 @@ class App:
     def open_official_catalog(self, url: str = OFFICIAL_CATALOG_URL) -> None:
         import webbrowser
         webbrowser.open(url)
-        self.status.set("已打开元气官方实时资源页；浏览和登录均由官方页面处理。")
+        self.status.set("已用浏览器打开元气官网；这不代表本客户端登录或资源接入。")
 
     def open_settings(self) -> None:
         dialog = tk.Toplevel(self.root); dialog.title("定时切换"); dialog.configure(bg=PANEL); dialog.geometry("360x190")

@@ -24,6 +24,61 @@ QQ / 微信 / 手机号
 
 因此，直接嵌入官方 H5 或修改 User-Agent 仍会被识别为普通网页：页面缺少官方原生桥，也没有平台签发给本项目的独立客户端身份。
 
+## 公开 sourcemap 还原出的精确调用顺序
+
+2026-08-16 重新读取官方 H5 当前发布的 `app.be8ed11e.js.map`，其中保留了原始
+`src/bridges/base.js`、`src/bridges/utils.js`、`src/bridges/constants.js` 和
+`src/utils/session.js`。可确认调用顺序为：
+
+- 当前 H5 入口：`https://yuanqi-wallpaper-h5.zhhainiao.com/`
+- 当前脚本 sourcemap：`https://yuanqi-wallpaper-h5.zhhainiao.com/js/app.be8ed11e.js.map`
+
+1. H5 检查 `window.navigate2Login.postMessage` 是否由原生宿主注入；
+2. H5 先安装全局回调 `window.callbackOnLogin`，再调用 `navigate2Login.postMessage()`；
+3. 原生登录完成后执行 `callbackOnLogin`；
+4. H5 再分别调用 `getUserInfo/callbackUserInfo` 和
+   `getDeviceInfo/callbackDeviceInfo`；
+5. 会话对象由用户信息和设备信息合并而成；每次业务请求将 `uid`、会话令牌和
+   `deviceId` 放进请求体的 `common` 字段；
+6. 只有资源服务继续接受该会话，登录才真正成立；前端回调本身不能代表授权成功。
+
+本项目已在 `app/yuanqi_auth.py` 中复刻上述桥方法和状态机，并以单元测试固定方法
+名、回调名以及“回调后必须服务端校验”的约束。代码不会记录或持久化令牌，也没有
+把官方前端中出现的产品参数当作本项目可使用的客户端凭据。
+
+## PC 原生侧的模块边界
+
+对本机已安装、带有效签名的官方二进制只做了可见字符串和导入表检查，没有反汇编、
+注入或读取账号数据。当前符号能把原生侧进一步拆成三层：
+
+- `kwallpaperui.exe`：包含 `KUserInfoDlg`、`DelayLoginTask`、
+  `UserInfoManager`；负责登录窗口和登录后用户状态刷新；
+- 同一模块包含 `DownloadQRCodeTask`、`QRCodeQueryWorker`、
+  `QueryScanTask`、`QRCodeScanListener`；说明“使用其他账号”中的扫码是原生任务，
+  不是官网里隐藏的登录表单；
+- `kvipgui.exe`：包含 `GetRecentCommonLoginList`、`DelRecentLoginData`、
+  `login_type`、`product_login_list` 等入口；这与实机看到的“上次登录账号 + 一键登录”
+  相吻合；
+- `KVipSdkClient/kvipsdk.dll`：承接登录后的统一账号/会员会话，再把结果提供给壁纸 UI。
+
+官方运行日志中出现的登录网关主机为 `viplogin.ijinshan.com`，会员会话校验路径包含
+`https://wpvip.duba.net/api/sdk/user/userInfo`。对登录网关根地址做无账号、无参数访问
+会直接返回 `403 Forbidden`，说明它不是可独立打开的网页登录页。检查日志时只抽取了
+主机名和无查询参数路径，没有读取或记录账号标识、令牌或请求参数值。
+
+```text
+H5 navigate2Login
+        │
+        ▼
+kwallpaperui：登录窗 / 上次账号 / 二维码任务
+        │
+        ▼
+kvipgui + kvipsdk：统一账号登录、设备和会员会话
+        │
+        ▼
+callbackOnLogin → getUserInfo + getDeviceInfo → 服务端校验
+```
+
 ## 独立客户端的正式接入条件
 
 在不依赖已安装官方客户端的前提下，元气适配器需要同时具备：
@@ -39,4 +94,3 @@ QQ / 微信 / 手机号
 ## 安全边界
 
 本研究只记录公开前端代码中的桥方法名和调用方向。项目不会提取、复制或复用官方客户端的 Cookie、令牌、设备标识或会员凭据，不绕过设备绑定、会员权限或服务端访问控制。
-
