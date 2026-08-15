@@ -55,6 +55,42 @@ DEFAULT_LOGIN_PROVIDER = LoginProvider.WECHAT
 
 
 @dataclass(frozen=True)
+class WechatLoginSurface:
+    """统一会员宿主承载的微信扫码页及其非秘密启动契约。"""
+
+    host_process: str = "kvipgui.exe"
+    open_web: str = "login"
+    product_id: int = 10
+    observed_vipfrom: int = 1035
+    default_provider: LoginProvider = LoginProvider.WECHAT
+    qr_instruction: str = "微信扫一扫登录"
+    requires_phone_confirmation: bool = True
+
+    @property
+    def observed_arguments(self) -> tuple[str, ...]:
+        return (
+            f"--open_web={self.open_web}",
+            f"--pid={self.product_id}",
+            f"--vipfrom={self.observed_vipfrom}",
+        )
+
+
+WECHAT_LOGIN_SURFACE = WechatLoginSurface()
+
+
+@dataclass(frozen=True)
+class WechatAuthReturnSurface:
+    """微信扫码确认后实机观察到的进程级非秘密信号。"""
+
+    external_host_closed: bool = True
+    main_host_survives: bool = True
+    refresh_requires_official_callback: bool = True
+
+
+WECHAT_AUTH_RETURN_SURFACE = WechatAuthReturnSurface()
+
+
+@dataclass(frozen=True)
 class PhoneLoginSurface:
     """官方电脑版手机登录标签中实机可见的控件。"""
 
@@ -110,7 +146,8 @@ class AuthPhase(str, Enum):
     UNAVAILABLE = "unavailable"
     SIGNED_OUT = "signed_out"
     WAITING_FOR_USER = "waiting_for_user"
-    QR_PENDING = "qr_pending"
+    WECHAT_QR_PENDING = "qr_pending"
+    QR_PENDING = "qr_pending"  # 兼容早期状态名。
     PHONE_PENDING = "phone_pending"
     PHONE_CODE_PENDING = "phone_code_pending"
     PHONE_SUBMITTING = "phone_submitting"
@@ -206,7 +243,7 @@ class YuanqiAuthCoordinator:
             return self._snapshot
         self.backend.navigate_to_login()
         self._snapshot = AuthSnapshot(
-            AuthPhase.QR_PENDING,
+            AuthPhase.WECHAT_QR_PENDING,
             "已拉起原生登录窗，默认等待用户使用微信扫码并在手机端确认。",
             provider=DEFAULT_LOGIN_PROVIDER.value,
         )
@@ -219,7 +256,7 @@ class YuanqiAuthCoordinator:
             return self._snapshot
         if provider is LoginProvider.WECHAT:
             self._snapshot = AuthSnapshot(
-                AuthPhase.QR_PENDING,
+                AuthPhase.WECHAT_QR_PENDING,
                 "等待用户使用微信扫码并在手机端确认。",
                 provider=provider.value,
             )

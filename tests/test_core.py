@@ -18,6 +18,8 @@ from yuanqi_auth import (
     QQ_LOGIN_SURFACE,
     QQ_AUTH_RETURN_SURFACE,
     QQLoginMethod,
+    WECHAT_AUTH_RETURN_SURFACE,
+    WECHAT_LOGIN_SURFACE,
     LoginInteraction,
     LoginProvider,
     UnavailableYuanqiLoginBackend,
@@ -85,6 +87,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(PHONE_LOGIN_SURFACE.submit_label, "登录")
         self.assertFalse(PHONE_LOGIN_SURFACE.requires_consent_checkbox)
 
+    def test_official_wechat_login_uses_unified_native_host(self):
+        self.assertEqual(WECHAT_LOGIN_SURFACE.host_process, "kvipgui.exe")
+        self.assertEqual(
+            WECHAT_LOGIN_SURFACE.observed_arguments,
+            ("--open_web=login", "--pid=10", "--vipfrom=1035"),
+        )
+        self.assertEqual(WECHAT_LOGIN_SURFACE.default_provider, LoginProvider.WECHAT)
+        self.assertTrue(WECHAT_LOGIN_SURFACE.requires_phone_confirmation)
+        self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.external_host_closed)
+        self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.main_host_survives)
+        self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.refresh_requires_official_callback)
+
     def test_official_qq_login_surface_matches_observed_window(self):
         self.assertEqual(QQ_LOGIN_SURFACE.window_title, "QQ帐号安全登录")
         self.assertEqual(QQ_LOGIN_SURFACE.host_process, "kvipgui.exe")
@@ -110,7 +124,7 @@ class CoreTests(unittest.TestCase):
             def verify_session(self, session): return False
 
         auth = YuanqiAuthCoordinator(FakeBackend())
-        self.assertEqual(auth.begin_login().phase, AuthPhase.QR_PENDING)
+        self.assertEqual(auth.begin_login().phase, AuthPhase.WECHAT_QR_PENDING)
         self.assertEqual(auth.snapshot.provider, LoginProvider.WECHAT.value)
         self.assertEqual(auth.select_login_provider(LoginProvider.PHONE).phase, AuthPhase.PHONE_PENDING)
         self.assertEqual(auth.select_login_provider(LoginProvider.QQ).phase, AuthPhase.QQ_QR_PENDING)
@@ -154,7 +168,7 @@ class CoreTests(unittest.TestCase):
 
         backend = FakeBackend()
         auth = YuanqiAuthCoordinator(backend)
-        self.assertEqual(auth.begin_login().phase, AuthPhase.QR_PENDING)
+        self.assertEqual(auth.begin_login().phase, AuthPhase.WECHAT_QR_PENDING)
         self.assertTrue(backend.opened)
         result = auth.callback_on_login({"ret": 0})
         self.assertEqual(result.phase, AuthPhase.AUTHENTICATED)

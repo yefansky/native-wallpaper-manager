@@ -1,0 +1,7 @@
+.echo [wechat-trace] non-secret control-flow trace loaded
+.echo [wechat-trace] values, registers, arguments, QR data and tokens are intentionally not dumped
+.echo [wechat-trace] only two low-frequency entry points are traced
+ba e 1 kwallpaperui+0x853e0 1 ".printf \"[wechat-trace] bridge:showlogin\\n\"; kb 4; g"
+ba e 1 kwallpaperui+0x610f2 1 ".printf \"[wechat-trace] native:login-launcher\\n\"; kb 5; g"
+.echo [wechat-trace] breakpoints armed
+g

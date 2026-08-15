@@ -25,6 +25,8 @@ from yuanqi_auth import (
     PHONE_LOGIN_SURFACE,
     QQ_LOGIN_SURFACE,
     QQ_AUTH_RETURN_SURFACE,
+    WECHAT_LOGIN_SURFACE,
+    WECHAT_AUTH_RETURN_SURFACE,
     UnavailableYuanqiLoginBackend,
     YuanqiAuthCoordinator,
 )
@@ -410,6 +412,15 @@ class App:
             f"{PHONE_LOGIN_SURFACE.phone_placeholder} → {PHONE_LOGIN_SURFACE.request_code_label} → "
             f"{PHONE_LOGIN_SURFACE.code_placeholder} → {PHONE_LOGIN_SURFACE.submit_label}"
         )
+        wechat_flow = (
+            f"{WECHAT_LOGIN_SURFACE.host_process} {' '.join(WECHAT_LOGIN_SURFACE.observed_arguments)} → "
+            f"{WECHAT_LOGIN_SURFACE.qr_instruction} → 手机端确认"
+        )
+        wechat_return = (
+            "统一登录宿主关闭 → 主宿主继续运行 → 官方回调/用户信息刷新 → 会话校验"
+            if WECHAT_AUTH_RETURN_SURFACE.external_host_closed
+            else "等待官方宿主回调"
+        )
         qq_flow = (
             f"{QQ_LOGIN_SURFACE.window_title} / 默认扫码 / {QQ_LOGIN_SURFACE.password_login_label} / "
             f"授权方：{QQ_LOGIN_SURFACE.relying_party}"
@@ -423,6 +434,8 @@ class App:
             "已复刻并测试的原生桥契约：\n\n"
             f"{methods}\n\n"
             f"实机登录入口：{options}（默认微信二维码）。\n\n"
+            f"微信登录：{wechat_flow}。\n\n"
+            f"微信回流：{wechat_return}。\n\n"
             f"手机登录：{phone_flow}。\n\n"
             f"QQ 登录：{qq_flow}。\n\n"
             f"QQ 回流：{qq_return}。\n\n"

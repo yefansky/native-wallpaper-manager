@@ -55,12 +55,29 @@ QQ / 微信 / 手机号
 - 顶部并列提供“手机登录”标签；
 - “其他方式登录”下方提供 QQ 入口；
 - 页面同时展示《用户协议》和《隐私政策》；
-- 登录窗由 `kwallpaperui.exe` 内嵌的原生/CEF 宿主显示，而不是官网页面。
+- 登录入口由 `kwallpaperui.exe` 发起，实际统一登录页由 `kvipgui.exe` 及其 CEF 子进程
+  承载，而不是官网页面。
 
-因此本地状态机把拉起登录后的默认阶段细化为 `QR_PENDING`，并为手机和 QQ 分别保留
-`PHONE_PENDING`、`QQ_PENDING`。这些阶段只描述用户可见的认证界面；只有
+因此本地状态机把拉起登录后的默认阶段细化为 `WECHAT_QR_PENDING`（保留
+`QR_PENDING` 兼容别名），并为手机和 QQ 分别保留 `PHONE_PENDING`、
+`QQ_QR_PENDING`。这些阶段只描述用户可见的认证界面；只有
 `callbackOnLogin` 成功后重新取得用户、设备信息并通过服务端校验，才会进入
 `AUTHENTICATED`。为避免保存临时认证材料，本项目没有留存或解码本次二维码截图。
+
+### 微信扫码宿主与回流
+
+账号本人完成了一次默认微信扫码登录。进程级只读追踪确认：
+
+1. 主 `kwallpaperui.exe` 拉起
+   `kvipgui.exe --open_web=login --pid=10 --vipfrom=1035`；
+2. `kvipgui.exe` 创建独立 CEF 渲染子进程承载微信扫码页；
+3. 用户在微信手机端确认后，`kvipgui.exe` 和登录渲染子进程退出；
+4. 主 `kwallpaperui.exe` 继续运行并进入账号态。
+
+本地模型据此新增 `WechatLoginSurface` 和 `WechatAuthReturnSurface`，固定“统一登录宿主
+启动 → 本人扫码确认 → 外部宿主关闭 → 官方回调/用户信息刷新 → 服务端校验”的非秘密
+流程。命令行中的产品来源参数只是当前官方版本的观察值，不是可供本项目复制的授权
+凭据。
 
 ### 手机登录标签
 
@@ -132,8 +149,9 @@ ABI、授权回调规范以及资源服务端校验权限。缺少任一项时�
 
 ## PC 原生侧的模块边界
 
-对本机已安装、带有效签名的官方二进制只做了可见字符串和导入表检查，没有反汇编、
-注入或读取账号数据。当前符号能把原生侧进一步拆成三层：
+对本机已安装、带有效签名的官方二进制做了 PE、RTTI、虚表、反汇编和只读控制流追踪；
+没有读取运行时账号字段、令牌、二维码或设备标识，也没有修改认证结果。当前证据能把
+原生侧进一步拆成三层：
 
 - `kwallpaperui.exe`：包含 `KUserInfoDlg`、`DelayLoginTask`、
   `UserInfoManager`；负责登录窗口和登录后用户状态刷新；
@@ -152,13 +170,16 @@ ABI、授权回调规范以及资源服务端校验权限。缺少任一项时�
 主机名和无查询参数路径，没有读取或记录账号标识、令牌或请求参数值。
 
 ```text
-H5 navigate2Login
+H5 navigate2Login / native showlogin
         │
         ▼
-kwallpaperui：登录窗 / 上次账号 / 二维码任务
+kwallpaperui：登录桥 / 统一登录启动器 / 主界面状态
         │
         ▼
-kvipgui + kvipsdk：统一账号登录、设备和会员会话
+kvipgui：微信 / 手机 / QQ 统一登录页
+        │
+        ▼
+kvipsdk：统一账号、设备和会员会话
         │
         ▼
 callbackOnLogin → getUserInfo + getDeviceInfo → 服务端校验
