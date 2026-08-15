@@ -47,6 +47,8 @@ python app/native_wallpaper.py
 
 `app/yuanqi_auth.py` 固化 `navigate2Login`、`callbackOnLogin`、`getUserInfo` 和 `getDeviceInfo` 等官方 H5 原生桥契约，并按实机登录窗建模微信二维码（默认）、手机登录和 QQ 三个入口。手机流程细分为请求验证码、等待验证码、提交和等待原生回调；手机号、验证码与令牌均不进入状态对象或持久化配置。
 
+QQ 入口会由官方统一会员宿主 `kvipgui.exe` 拉起独立的“QQ帐号安全登录”页，默认使用 QQ 手机版扫码，也提供腾讯页面内的密码登录。实机授权方显示为“金山毒霸”，因此本项目只建模委托授权状态，不接收 QQ 密码，也不会复用该产品身份。
+
 “资源接入”页不再显示不可点击的假分类。当前可执行动作是迁移本机已有静态缓存；联网账号、持续更新与会员原图仍必须等本客户端取得受支持的正式授权后才显示。
 
 官方客户端登录与 H5 原生桥的实机研究记录见 [`docs/yuanqi-auth-architecture.md`](docs/yuanqi-auth-architecture.md)。

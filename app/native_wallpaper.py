@@ -23,6 +23,7 @@ from yuanqi_auth import (
     BRIDGE_METHODS,
     LOGIN_OPTIONS,
     PHONE_LOGIN_SURFACE,
+    QQ_LOGIN_SURFACE,
     UnavailableYuanqiLoginBackend,
     YuanqiAuthCoordinator,
 )
@@ -408,12 +409,17 @@ class App:
             f"{PHONE_LOGIN_SURFACE.phone_placeholder} → {PHONE_LOGIN_SURFACE.request_code_label} → "
             f"{PHONE_LOGIN_SURFACE.code_placeholder} → {PHONE_LOGIN_SURFACE.submit_label}"
         )
+        qq_flow = (
+            f"{QQ_LOGIN_SURFACE.window_title} / 默认扫码 / {QQ_LOGIN_SURFACE.password_login_label} / "
+            f"授权方：{QQ_LOGIN_SURFACE.relying_party}"
+        )
         messagebox.showinfo(
             "元气电脑版登录桥自检",
             "已复刻并测试的原生桥契约：\n\n"
             f"{methods}\n\n"
             f"实机登录入口：{options}（默认微信二维码）。\n\n"
             f"手机登录：{phone_flow}。\n\n"
+            f"QQ 登录：{qq_flow}。\n\n"
             "状态流：拉起登录 → 选择入口/本人认证 → 登录回调 → 用户/设备信息 → 服务端校验。\n\n"
             f"当前：{self.yuanqi_auth.snapshot.message}",
         )

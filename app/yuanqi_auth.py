@@ -69,6 +69,30 @@ class PhoneLoginSurface:
 PHONE_LOGIN_SURFACE = PhoneLoginSurface()
 
 
+class QQLoginMethod(str, Enum):
+    QUICK_QR = "quick_qr"
+    PASSWORD = "password"
+
+
+@dataclass(frozen=True)
+class QQLoginSurface:
+    """统一会员宿主拉起的腾讯 QQ 授权窗口。"""
+
+    window_title: str = "QQ帐号安全登录"
+    host_process: str = "kvipgui.exe"
+    default_method: QQLoginMethod = QQLoginMethod.QUICK_QR
+    qr_instruction: str = "使用QQ手机版扫码登录。"
+    password_login_label: str = "密码登录"
+    register_label: str = "注册账号"
+    feedback_label: str = "意见反馈"
+    relying_party: str = "金山毒霸"
+    permission_scope: str = "使用你的QQ头像、昵称信息"
+    consent_notice: str = "授权即同意服务协议和QQ隐私保护指引"
+
+
+QQ_LOGIN_SURFACE = QQLoginSurface()
+
+
 class AuthPhase(str, Enum):
     UNAVAILABLE = "unavailable"
     SIGNED_OUT = "signed_out"
@@ -77,7 +101,8 @@ class AuthPhase(str, Enum):
     PHONE_PENDING = "phone_pending"
     PHONE_CODE_PENDING = "phone_code_pending"
     PHONE_SUBMITTING = "phone_submitting"
-    QQ_PENDING = "qq_pending"
+    QQ_QR_PENDING = "qq_qr_pending"
+    QQ_PASSWORD_PENDING = "qq_password_pending"
     VERIFYING = "verifying"
     AUTHENTICATED = "authenticated"
     EXPIRED = "expired"
@@ -193,10 +218,26 @@ class YuanqiAuthCoordinator:
             )
         else:
             self._snapshot = AuthSnapshot(
-                AuthPhase.QQ_PENDING,
-                "等待用户通过原生 QQ 入口完成认证。",
+                AuthPhase.QQ_QR_PENDING,
+                "QQ 安全登录窗口已打开，等待用户使用 QQ 手机版扫码。",
                 provider=provider.value,
             )
+        return self._snapshot
+
+    def select_qq_method(self, method: QQLoginMethod) -> AuthSnapshot:
+        """记录 QQ 授权页当前方式；密码和二维码均由腾讯页面处理。"""
+
+        if not self.backend.configured():
+            return self._snapshot
+        if self._snapshot.provider != LoginProvider.QQ.value:
+            raise RuntimeError("必须先进入 QQ 登录页。")
+        if method is QQLoginMethod.QUICK_QR:
+            phase = AuthPhase.QQ_QR_PENDING
+            message = "等待用户使用 QQ 手机版扫码并确认授权。"
+        else:
+            phase = AuthPhase.QQ_PASSWORD_PENDING
+            message = "等待用户在 QQ 安全登录窗口中完成密码认证。"
+        self._snapshot = AuthSnapshot(phase, message, provider=LoginProvider.QQ.value)
         return self._snapshot
 
     def request_phone_code(self, phone_number: str) -> AuthSnapshot:

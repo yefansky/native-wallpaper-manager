@@ -15,6 +15,8 @@ from yuanqi_auth import (
     DEFAULT_LOGIN_PROVIDER,
     LOGIN_OPTIONS,
     PHONE_LOGIN_SURFACE,
+    QQ_LOGIN_SURFACE,
+    QQLoginMethod,
     LoginInteraction,
     LoginProvider,
     UnavailableYuanqiLoginBackend,
@@ -82,6 +84,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(PHONE_LOGIN_SURFACE.submit_label, "登录")
         self.assertFalse(PHONE_LOGIN_SURFACE.requires_consent_checkbox)
 
+    def test_official_qq_login_surface_matches_observed_window(self):
+        self.assertEqual(QQ_LOGIN_SURFACE.window_title, "QQ帐号安全登录")
+        self.assertEqual(QQ_LOGIN_SURFACE.host_process, "kvipgui.exe")
+        self.assertEqual(QQ_LOGIN_SURFACE.default_method, QQLoginMethod.QUICK_QR)
+        self.assertEqual(QQ_LOGIN_SURFACE.password_login_label, "密码登录")
+        self.assertEqual(QQ_LOGIN_SURFACE.relying_party, "金山毒霸")
+        self.assertEqual(QQ_LOGIN_SURFACE.permission_scope, "使用你的QQ头像、昵称信息")
+
     def test_yuanqi_login_provider_state_transitions(self):
         class FakeBackend:
             def configured(self): return True
@@ -96,7 +106,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(auth.begin_login().phase, AuthPhase.QR_PENDING)
         self.assertEqual(auth.snapshot.provider, LoginProvider.WECHAT.value)
         self.assertEqual(auth.select_login_provider(LoginProvider.PHONE).phase, AuthPhase.PHONE_PENDING)
-        self.assertEqual(auth.select_login_provider(LoginProvider.QQ).phase, AuthPhase.QQ_PENDING)
+        self.assertEqual(auth.select_login_provider(LoginProvider.QQ).phase, AuthPhase.QQ_QR_PENDING)
+        self.assertEqual(auth.select_qq_method(QQLoginMethod.PASSWORD).phase, AuthPhase.QQ_PASSWORD_PENDING)
+        self.assertEqual(auth.select_qq_method(QQLoginMethod.QUICK_QR).phase, AuthPhase.QQ_QR_PENDING)
 
     def test_phone_code_flow_does_not_store_phone_or_code_in_snapshot(self):
         class FakeBackend:
