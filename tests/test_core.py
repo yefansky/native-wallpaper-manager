@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
 from catalog import IntegrationUnavailable, YuanqiOfficialApiSource
+from official_catalog_view import DEFAULT_URL, validated_official_url
 
 
 class CoreTests(unittest.TestCase):
@@ -30,6 +31,28 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(capabilities.original_download)
         with self.assertRaises(IntegrationUnavailable):
             source.list_items("landscape")
+
+    def test_embedded_catalog_only_allows_official_https_host(self):
+        self.assertEqual(validated_official_url(DEFAULT_URL), DEFAULT_URL)
+        with self.assertRaises(ValueError):
+            validated_official_url("https://example.com/")
+        with self.assertRaises(ValueError):
+            validated_official_url("http://bizhi.cheetahfun.com/")
+
+    def test_no_desktop_overlay_or_explorer_injection(self):
+        source = (Path(__file__).parents[1] / "app" / "native_wallpaper.py").read_text(encoding="utf-8")
+        forbidden = ("WorkerW", "SetParent", "Progman", "FindWindowW", "ShowWindow", "SHELLDLL_DefView")
+        for symbol in forbidden:
+            self.assertNotIn(symbol, source)
+        self.assertIn("SystemParametersInfoW", source)
+
+    def test_embedded_catalog_does_not_require_official_client_installation(self):
+        helper = (Path(__file__).parents[1] / "app" / "official_catalog_view.py").read_text(encoding="utf-8").lower()
+        main = (Path(__file__).parents[1] / "app" / "native_wallpaper.py").read_text(encoding="utf-8").lower()
+        for source in (helper, main):
+            self.assertNotIn("program files", source)
+            self.assertNotIn("kwallpaperui", source)
+            self.assertNotIn("\\kdesk\\", source)
 
     def test_config_round_trip(self):
         original = app.CONFIG_PATH
