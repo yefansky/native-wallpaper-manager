@@ -12,6 +12,12 @@ class CoreTests(unittest.TestCase):
         self.assertIn(".jpg", app.IMAGE_EXTENSIONS)
         self.assertNotIn(".mp4", app.IMAGE_EXTENSIONS)
 
+    def test_official_showcase_links_are_static_https_images(self):
+        self.assertEqual(len(app.OFFICIAL_FEATURED), 5)
+        for _, url in app.OFFICIAL_FEATURED:
+            self.assertTrue(url.startswith("https://"))
+            self.assertEqual(Path(url).suffix, ".png")
+
     def test_config_round_trip(self):
         original = app.CONFIG_PATH
         with tempfile.TemporaryDirectory() as temp:

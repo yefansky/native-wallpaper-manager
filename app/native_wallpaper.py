@@ -5,7 +5,6 @@ import ctypes
 import json
 import shutil
 import threading
-import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -17,6 +16,13 @@ APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
 WALLPAPER_DIR = APP_DIR / "wallpapers"
 CONFIG_PATH = APP_DIR / "config.json"
 IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png"}
+OFFICIAL_FEATURED = (
+    ("樱花树下的少女", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm7.png"),
+    ("日落", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm8.png"),
+    ("云朵与少女", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm5.png"),
+    ("无缝风铃蝴蝶房屋独寂", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm4.png"),
+    ("中国故宫少女", "https://wallpaper-static.cheetahfun.com/wallpaper/sites/dynamics/vm6.png"),
+)
 SPI_SETDESKWALLPAPER = 20
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
@@ -58,6 +64,26 @@ def set_native_wallpaper(path: Path) -> None:
         raise ctypes.WinError()
 
 
+def download_static_image(url: str, title: str, source: str) -> Wallpaper:
+    """下载一个公开或用户已授权的静态图片到本地资料库。"""
+    parsed = urllib.parse.urlparse(url)
+    suffix = Path(parsed.path).suffix.lower()
+    if parsed.scheme != "https" or suffix not in IMAGE_EXTENSIONS:
+        raise ValueError("只接受明确指向 BMP/JPG/JPEG/PNG 的 HTTPS 图片直链")
+    target = WALLPAPER_DIR / f"{uuid.uuid4().hex}{suffix}"
+    request = urllib.request.Request(url, headers={"User-Agent": "NativeWallpaperManager/0.2"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response, target.open("xb") as output:
+            content_type = response.headers.get_content_type()
+            if not content_type.startswith("image/"):
+                raise ValueError("服务器没有返回图片内容")
+            shutil.copyfileobj(response, output)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return Wallpaper(uuid.uuid4().hex, str(target), title, source=source)
+
+
 class App:
     def __init__(self, root: Tk):
         self.root = root
@@ -77,6 +103,7 @@ class App:
         controls = Frame(self.root, padx=12, pady=12)
         controls.pack(fill="x")
         Button(controls, text="导入图片", command=self.import_images).pack(side=LEFT, padx=(0, 8))
+        Button(controls, text="同步官网精选", command=self.sync_official_featured).pack(side=LEFT, padx=8)
         Button(controls, text="下载直链", command=self.download_url).pack(side=LEFT, padx=8)
         Button(controls, text="打开元气官网", command=self.open_official_site).pack(side=LEFT, padx=8)
         Button(controls, text="设置定时", command=self.open_settings).pack(side=RIGHT, padx=(8, 0))
@@ -136,6 +163,20 @@ class App:
         except (OSError, ValueError) as exc:
             messagebox.showerror("导入失败", str(exc))
 
+    def sync_official_featured(self) -> None:
+        """同步官网首页可见的公开展示图，不登录、不使用私有接口。"""
+        existing = {(item.title, item.source) for item in self.items}
+        added = 0
+        try:
+            for title, url in OFFICIAL_FEATURED:
+                if (title, "元气官网公开精选") not in existing:
+                    self.items.append(download_static_image(url, title, "元气官网公开精选"))
+                    added += 1
+            self.refresh()
+            self.status.set("官网精选已是最新。" if added == 0 else f"已同步官网公开精选 {added} 张，可直接选择应用。")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("同步失败", str(exc))
+
     def apply_selected(self) -> None:
         item = self.selected()
         if not item:
@@ -193,15 +234,11 @@ class App:
             suffix = Path(parsed.path).suffix.lower()
             if suffix not in IMAGE_EXTENSIONS:
                 messagebox.showerror("下载失败", "链接必须明确指向 BMP/JPG/JPEG/PNG 静态图片。", parent=dialog); return
-            target = WALLPAPER_DIR / f"{uuid.uuid4().hex}{suffix}"
             try:
-                request = urllib.request.Request(url, headers={"User-Agent": "NativeWallpaperManager/0.1"})
-                with urllib.request.urlopen(request, timeout=30) as response, target.open("wb") as output:
-                    shutil.copyfileobj(response, output)
-                self.items.append(Wallpaper(uuid.uuid4().hex, str(target), Path(parsed.path).stem or "下载壁纸", source="授权直链"))
+                self.items.append(download_static_image(url, Path(parsed.path).stem or "下载壁纸", "授权直链"))
                 self.refresh(); self.status.set("下载完成，已加入资料库。"); dialog.destroy()
-            except OSError as exc:
-                target.unlink(missing_ok=True); messagebox.showerror("下载失败", str(exc), parent=dialog)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("下载失败", str(exc), parent=dialog)
         Button(dialog, text="下载并加入资料库", command=run).pack(pady=10)
 
     def open_official_site(self) -> None:
