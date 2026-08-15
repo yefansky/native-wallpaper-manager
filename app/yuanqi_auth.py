@@ -79,12 +79,33 @@ WECHAT_LOGIN_SURFACE = WechatLoginSurface()
 
 
 @dataclass(frozen=True)
+class KvipGuiLoginBridgeBoundary:
+    """统一登录页到会员 SDK 的内部桥边界。
+
+    方法名和字段名来自静态控制流，只用于识别官方状态链。`userLogin` 会接收
+    登录凭据，因此自研后端不得调用、模拟或重放该入口。
+    """
+
+    refresh_method: str = "refreshUserInfo"
+    credential_ingress_method: str = "userLogin"
+    state_query_method: str = "isUserLogin"
+    result_field: str = "result"
+    credential_field_names: tuple[str, ...] = ("token", "open_id")
+    self_close_window_message: str = "WM_CLOSE"
+    direct_credential_replay_supported: bool = False
+
+
+KVIPGUI_LOGIN_BRIDGE_BOUNDARY = KvipGuiLoginBridgeBoundary()
+
+
+@dataclass(frozen=True)
 class WechatAuthReturnSurface:
     """微信扫码确认后实机观察到的进程级非秘密信号。"""
 
     external_host_closed: bool = True
     main_host_survives: bool = True
     refresh_requires_official_callback: bool = True
+    child_exit_is_authentication_proof: bool = False
 
 
 WECHAT_AUTH_RETURN_SURFACE = WechatAuthReturnSurface()

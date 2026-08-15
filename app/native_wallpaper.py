@@ -25,6 +25,7 @@ from yuanqi_auth import (
     PHONE_LOGIN_SURFACE,
     QQ_LOGIN_SURFACE,
     QQ_AUTH_RETURN_SURFACE,
+    KVIPGUI_LOGIN_BRIDGE_BOUNDARY,
     WECHAT_LOGIN_SURFACE,
     WECHAT_AUTH_RETURN_SURFACE,
     UnavailableYuanqiLoginBackend,
@@ -421,6 +422,11 @@ class App:
             if WECHAT_AUTH_RETURN_SURFACE.external_host_closed
             else "等待官方宿主回调"
         )
+        wechat_internal_boundary = (
+            f"{KVIPGUI_LOGIN_BRIDGE_BOUNDARY.state_query_method} → "
+            f"{KVIPGUI_LOGIN_BRIDGE_BOUNDARY.self_close_window_message}；"
+            f"{KVIPGUI_LOGIN_BRIDGE_BOUNDARY.credential_ingress_method} 为官方凭据入口，不复刻"
+        )
         qq_flow = (
             f"{QQ_LOGIN_SURFACE.window_title} / 默认扫码 / {QQ_LOGIN_SURFACE.password_login_label} / "
             f"授权方：{QQ_LOGIN_SURFACE.relying_party}"
@@ -436,6 +442,7 @@ class App:
             f"实机登录入口：{options}（默认微信二维码）。\n\n"
             f"微信登录：{wechat_flow}。\n\n"
             f"微信回流：{wechat_return}。\n\n"
+            f"微信内部边界：{wechat_internal_boundary}。\n\n"
             f"手机登录：{phone_flow}。\n\n"
             f"QQ 登录：{qq_flow}。\n\n"
             f"QQ 回流：{qq_return}。\n\n"

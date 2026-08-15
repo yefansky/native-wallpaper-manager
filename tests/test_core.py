@@ -13,6 +13,7 @@ from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
     DEFAULT_LOGIN_PROVIDER,
+    KVIPGUI_LOGIN_BRIDGE_BOUNDARY,
     LOGIN_OPTIONS,
     PHONE_LOGIN_SURFACE,
     QQ_LOGIN_SURFACE,
@@ -98,6 +99,17 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.external_host_closed)
         self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.main_host_survives)
         self.assertTrue(WECHAT_AUTH_RETURN_SURFACE.refresh_requires_official_callback)
+        self.assertFalse(WECHAT_AUTH_RETURN_SURFACE.child_exit_is_authentication_proof)
+
+    def test_kvipgui_internal_bridge_does_not_authorize_credential_replay(self):
+        boundary = KVIPGUI_LOGIN_BRIDGE_BOUNDARY
+        self.assertEqual(boundary.refresh_method, "refreshUserInfo")
+        self.assertEqual(boundary.state_query_method, "isUserLogin")
+        self.assertEqual(boundary.credential_ingress_method, "userLogin")
+        self.assertEqual(boundary.result_field, "result")
+        self.assertEqual(boundary.credential_field_names, ("token", "open_id"))
+        self.assertEqual(boundary.self_close_window_message, "WM_CLOSE")
+        self.assertFalse(boundary.direct_credential_replay_supported)
 
     def test_official_qq_login_surface_matches_observed_window(self):
         self.assertEqual(QQ_LOGIN_SURFACE.window_title, "QQ帐号安全登录")
