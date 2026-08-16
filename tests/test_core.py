@@ -27,9 +27,11 @@ from catalog import (
     validate_resource_preview_video_url,
 )
 from dynamic_converter import (
+    ConversionUnavailable,
     ConvertedFrame,
     candidate_timestamps,
     convert_preview_video_to_jpeg,
+    decrypt_video_bytes,
     frame_quality,
     load_cached_frame,
     store_cached_frame,
@@ -282,6 +284,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(points), 5)
         self.assertGreater(points[0], 1.0)
         self.assertLess(points[-1], 9.0)
+
+    def test_xor_video_decryption_keeps_key_alignment_across_chunks(self):
+        plain = bytes(range(255)) * 9
+        encrypted = decrypt_video_bytes(plain)
+        split = 317
+        decoded = decrypt_video_bytes(encrypted[:split], 0) + decrypt_video_bytes(encrypted[split:], split)
+        self.assertEqual(decoded, plain)
 
     def test_dynamic_frame_quality_prefers_sharp_picture(self):
         from PIL import ImageFilter
@@ -751,7 +760,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(page.items[0].components, ("mouse_tail", "theme"))
         self.assertTrue(app.theme_has_live_component_risk(page.items[0]))
         self.assertEqual(source.download_original("58297"), b"theme-jpeg")
-        converter.assert_called_once_with(raw["preview_video"], http=source._http, decrypt=False)
+        self.assertEqual(
+            converter.call_args_list,
+            [
+                unittest.mock.call(raw["preview_video"], http=source._http, decrypt=False),
+            ],
+        )
+        self.assertTrue(source.conversion_summary("58297").startswith("预览回退 · "))
 
     def test_theme_featured_combines_carousel_and_cursor_pages(self):
         source = YuanqiThemeResourceSource(
@@ -817,6 +832,24 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(item.source_video_url, raw["video"])
         self.assertEqual(source.download_original(item.id), b"jpeg-data")
         converter.assert_called_once_with(raw["video"], http=source._http, decrypt=True)
+
+    def test_dynamic_source_failure_falls_back_to_preview_video(self):
+        converted = ConvertedFrame(b"preview-jpeg", 1920, 1080, 3.3, 100.0, 5)
+        converter = unittest.mock.Mock(side_effect=[ConversionUnavailable("not mp4"), converted])
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
+        )
+        item = CatalogItem(
+            "1", "测试", "https://img-baofun.zhhainiao.com/frame.jpg",
+            resource_kind="dynamic",
+            source_video_url="https://img-baofun.zhhainiao.com/source.mp4",
+            preview_video_url="https://img-baofun.zhhainiao.com/source_preview.mp4",
+        )
+        source._items_by_id[item.id] = item
+
+        self.assertEqual(source.download_original(item.id), b"preview-jpeg")
+        self.assertEqual(len(converter.call_args_list), 2)
+        self.assertTrue(source.conversion_summary(item.id).startswith("预览回退 · "))
 
     def test_dynamic_global_search_uses_official_endpoint(self):
         source = YuanqiDynamicResourceSource(

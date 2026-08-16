@@ -626,6 +626,9 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
         body.update({"cate_id": cate_id, "tag_id": tag_id, "sort_type": SORT_HOT_DESC})
         return self._page_from_list_payload(self._post(DYNAMIC_LIST_URL, body), page)
 
+    def _source_conversion_allowed(self, item: CatalogItem) -> bool:
+        return bool(item.source_video_url)
+
     def download_original(self, item_id: str) -> bytes:
         item = self._items_by_id.get(str(item_id))
         if item is None:
@@ -635,7 +638,9 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
 
         converted: ConvertedFrame | None = None
         source_error: ConversionUnavailable | CatalogError | None = None
-        if item.source_video_url:
+        if item.source_video_url and not self._source_conversion_allowed(item):
+            source_error = ConversionUnavailable("正式资源是暂不支持的私有容器")
+        elif item.source_video_url:
             try:
                 source_url = validate_resource_source_video_url(item.source_video_url)
                 converted = self._converter(source_url, http=self._http, decrypt=True)
@@ -704,6 +709,12 @@ class YuanqiThemeResourceSource(YuanqiDynamicResourceSource):
         self._featured_pages.clear()
         self._featured_cursors = {1: ""}
         self._carousel_items = None
+
+    def _source_conversion_allowed(self, item: CatalogItem) -> bool:
+        # 主题接口的 video 字段常是 ZIP 资源包或真 CWP3，而不是 XOR 包装的 MP4。
+        # 现有转换器只处理能还原成标准视频的流；提前跳过可避免每次白下载几十 MiB。
+        path = urlparse(item.source_video_url).path.casefold()
+        return bool(path) and not path.endswith((".zip", ".cwp"))
 
     def refresh_categories(self) -> tuple[CatalogCategory, ...]:
         if self._server_categories is not None:

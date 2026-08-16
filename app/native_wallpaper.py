@@ -69,16 +69,18 @@ OFFICIAL_FEATURED_SOURCE = "元气官网首页公开展示"
 LEGACY_FEATURED_SOURCES = {"元气官网公开精选", "元气官网精选", OFFICIAL_FEATURED_SOURCE}
 YUANQI_CACHE_SOURCE = "本机元气静态缓存（已独立复制）"
 SCENE_COMPONENT_WARNING = (
-    "这是元气 scene 场景主题。它的 preview_video 可能已经把时间、天气等组件合成进每一帧；"
-    "转换成 JPEG 后，这些内容会变成不会更新的固定文字。\n\n"
+    "这是元气 scene 场景主题。桌面画廊会先尝试可验证的正式画面；若正式资源无法按标准视频解码，"
+    "会回退 preview_video，而预览可能已经把时间、天气等组件合成进每一帧。转换成 JPEG 后，"
+    "这些内容会变成不会更新的固定文字。\n\n"
     "Windows 原生壁纸不能承载元气场景组件，桌面画廊也无法从已合成画面可靠还原被遮挡的背景。\n\n"
     "继续转换会原样保留画面中的组件。是否仍然继续？"
 )
 THEME_CONVERSION_WARNING = (
     "元气电脑主题可能包含动态壁纸、时钟/天气/系统信息、鼠标特效、任务栏和窗口皮肤。"
     "这些组件依赖元气私有播放器或美化引擎，Windows 原生 .theme 不能承载。\n\n"
-    "桌面画廊只会从标准 preview_video 多点选择高清帧，并生成只包含该静态壁纸的 Windows 原生 .theme 文件。"
-    "预览中已经合成的文字或组件会保留为不会更新的固定画面。\n\n"
+    "桌面画廊会优先尝试可验证的正式画面；若 CWP3/资源包不能由标准解码器验证，则回退标准 preview_video。"
+    "两种路径都会多点选择高清帧，并生成只包含该静态壁纸的 Windows 原生 .theme 文件。"
+    "回退预览中已经合成的文字或组件会保留为不会更新的固定画面。\n\n"
     "是否接受这种原生静态降级并继续？"
 )
 DEFAULT_YUANQI_CACHE_DIRS = (
@@ -135,7 +137,9 @@ def theme_has_live_component_risk(item: CatalogItem) -> bool:
     if item.resource_kind != "theme":
         return False
     text = item.search_text
-    return any(keyword in text for keyword in ("时钟", "时间", "实时", "天气", "系统信息", "组件"))
+    has_named_risk = any(keyword in text for keyword in ("时钟", "时间", "实时", "天气", "系统信息", "组件"))
+    has_private_component = any(component.casefold() not in {"", "theme"} for component in item.components)
+    return has_named_risk or has_private_component
 
 
 def load_config() -> dict:
@@ -587,7 +591,7 @@ class App:
             self.online_mode_buttons[mode] = button
         self.dynamic_mode_notice = tk.Label(
             mode_row,
-            text="动态资源仅解码 preview_video，多点选帧后生成原生 JPEG；不接入 CWP/加密视频。",
+            text="动态资源优先可验证高清源，失败回退 preview_video；多点选帧生成原生 JPEG。",
             bg=BG,
             fg=MUTED,
             font=("Microsoft YaHei UI", 8),
@@ -699,9 +703,9 @@ class App:
             button.configure(bg=GOLD if key == mode else NAV_BG)
         self.dynamic_mode_notice.configure(
             text=(
-                "电脑主题仅保留 preview_video 择优静态帧并生成 Windows 原生 .theme；私有组件不接入。"
+                "电脑主题优先可验证正式画面、失败回退 preview_video；生成原生 .theme，私有组件不接入。"
                 if mode == "theme"
-                else "动态资源仅解码 preview_video，多点选帧后生成原生 JPEG；不接入 CWP/加密视频。"
+                else "动态资源优先可验证高清源，失败回退 preview_video；多点选帧生成原生 JPEG。"
             )
         )
         if reset:
@@ -1113,7 +1117,7 @@ class App:
                 self.online_download_button.configure(text="转换到本地" if dynamic else "下载到本地")
                 self.online_apply_button.configure(text="转换并设为壁纸" if dynamic else "下载并设为壁纸")
         if item.resource_kind == "theme":
-            suffix = "；只保留壁纸并生成 Windows 原生 .theme，私有组件不会接入。"
+            suffix = "；优先正式画面、失败回退预览，只保留壁纸并生成 Windows 原生 .theme。"
         else:
             suffix = "；将从预览视频多点选取高清帧。" if item.resource_kind == "dynamic" else "；双击卡片可查看大图。"
         self.status.set(f"已选择：{item.title}{suffix}")
@@ -1135,10 +1139,10 @@ class App:
             tk.Label(
                 dialog,
                 text=(
-                    "电脑主题会从 preview_video 的 5 个时间点择优生成静态壁纸和 Windows 原生 .theme；"
-                    "鼠标、任务栏、窗口皮肤及动态组件不接入。"
+                    "电脑主题优先尝试可验证的正式画面，失败时从 preview_video 回退；"
+                    "两者均从 5 个时间点择优生成静态壁纸和 Windows 原生 .theme，私有组件不接入。"
                     if item.resource_kind == "theme"
-                    else "画面预览仅用于浏览；转换时会从原始 preview_video 的 5 个时间点解码全分辨率帧并自动择优，不取首帧。"
+                    else "画面预览仅用于浏览；转换优先可验证高清源、失败回退 preview_video，并从 5 个时间点解码全分辨率帧择优，不取首帧。"
                 ),
                 bg=PANEL,
                 fg=PINK,
