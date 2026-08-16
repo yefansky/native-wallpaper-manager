@@ -19,6 +19,7 @@ from PIL import Image
 CATALOG_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/list"
 SUGGEST_URL = "https://pcwallpaper.zhhainiao.com/v1/suggestion/suggest"
 PAGE_SIZE = 24
+FULL_INDEX_PAGE_SIZE = 50
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 RESOURCE_IMAGE_HOSTS = {
     "img-baofun.zhhainiao.com",
@@ -229,14 +230,14 @@ class YuanqiResourceSource:
             price=int(raw.get("price") or 0),
         )
 
-    def _list_server_page(self, category_id: str, page: int) -> CatalogPage:
+    def _list_server_page(self, category_id: str, page: int, page_size: int = PAGE_SIZE) -> CatalogPage:
         if page < 1:
             raise ValueError("页码必须从 1 开始")
         body: dict[str, object] = {
             "login_info": {},
             "common": self._common(),
             "page": page,
-            "page_size": PAGE_SIZE,
+            "page_size": page_size,
             "cate_id": int(category_id or "0"),
             "tag_id": 0,
             "sort_type": 1,
@@ -258,7 +259,9 @@ class YuanqiResourceSource:
             total = 0
         return CatalogPage(items, page, has_more, total)
 
-    def _ensure_full_index(self) -> tuple[CatalogItem, ...]:
+    def _ensure_full_index(
+        self, progress_cb: Callable[[int, int], None] | None = None
+    ) -> tuple[CatalogItem, ...]:
         if self._full_index is not None:
             return self._full_index
         with self._index_lock:
@@ -267,7 +270,9 @@ class YuanqiResourceSource:
             collected: dict[str, CatalogItem] = {}
             page = 1
             while page <= 100:
-                result = self._list_server_page("0", page)
+                if progress_cb:
+                    progress_cb(len(collected), page)
+                result = self._list_server_page("0", page, FULL_INDEX_PAGE_SIZE)
                 for item in result.items:
                     collected[item.id] = item
                 if not result.has_more:
@@ -278,6 +283,24 @@ class YuanqiResourceSource:
                 page += 1
             self._full_index = tuple(collected.values())
             return self._full_index
+
+    def search(
+        self,
+        keyword: str,
+        page: int = 1,
+        page_size: int = PAGE_SIZE,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> CatalogPage:
+        """搜索壁纸：基于后台同步的全站索引做本地过滤，索引缓存后无需重复同步。"""
+        keyword = keyword.strip()
+        if not keyword:
+            return CatalogPage((), page, False, 0)
+        index = self._ensure_full_index(progress_cb)
+        terms = tuple(part for part in keyword.casefold().split() if part)
+        filtered = [item for item in index if all(term in item.search_text for term in terms)]
+        start = (page - 1) * page_size
+        items = tuple(filtered[start:start + page_size])
+        return CatalogPage(items, page, start + len(items) < len(filtered), len(filtered))
 
     @staticmethod
     def _is_4k(item: CatalogItem) -> bool:

@@ -8,6 +8,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
+import session_store as session_store
 from catalog import CatalogError, IntegrationUnavailable, YuanqiOfficialApiSource, YuanqiResourceSource
 from yuanqi_auth import (
     AuthPhase,
@@ -304,6 +305,39 @@ class CoreTests(unittest.TestCase):
             }
             with self.assertRaises(CatalogError):
                 source.list_items("0", 1)
+
+    def test_resource_source_search_filters_cached_index(self):
+        def session(): return {"uid": "open-1", "token": "tok-1"}
+        def device(): return {"deviceId": "dev-1"}
+        source = YuanqiResourceSource(session, device)
+        items = [
+            {"id": "1", "wname": "海边落日", "jpg_url": "https://img-baofun.zhhainiao.com/a.jpg", "cid": 1, "cname": "风景"},
+            {"id": "2", "wname": "都市夜景", "jpg_url": "https://img-baofun.zhhainiao.com/b.jpg", "cid": 5, "cname": "美女"},
+            {"id": "3", "wname": "海边小屋", "jpg_url": "https://img-baofun.zhhainiao.com/c.jpg", "cid": 1, "cname": "风景"},
+        ]
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0},
+                "data": {"list": items, "total": 3},
+            }
+            page = source.search("海边")
+        self.assertEqual(len(page.items), 2)
+        self.assertIn(page.items[0].title, ("海边落日", "海边小屋"))
+        self.assertEqual(page.total, 2)
+
+    def test_session_store_round_trip_encrypted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            original = session_store.SESSION_PATH
+            session_store.SESSION_PATH = Path(temp) / "session.enc"
+            try:
+                session_store.save_session("tok-secret", "open-1", "dev-1")
+                self.assertEqual(session_store.load_session(), ("tok-secret", "open-1", "dev-1"))
+                cipher = session_store.SESSION_PATH.read_bytes()
+                self.assertNotIn(b"tok-secret", cipher)
+                session_store.clear_session()
+                self.assertIsNone(session_store.load_session())
+            finally:
+                session_store.SESSION_PATH = original
 
     def test_config_round_trip(self):
         original = app.CONFIG_PATH
