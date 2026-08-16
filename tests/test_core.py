@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
 import session_store as session_store
 from product import SingleInstance, autostart_command, autostart_enabled, set_autostart
-from catalog import CatalogError, IntegrationUnavailable, YuanqiOfficialApiSource, YuanqiResourceSource
+from catalog import CatalogError, CatalogItem, IntegrationUnavailable, YuanqiOfficialApiSource, YuanqiResourceSource
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -238,6 +238,48 @@ class CoreTests(unittest.TestCase):
         self.assertGreater(app.LOCAL_PAGE_SIZE, 0)
         self.assertLessEqual(app.LOCAL_PAGE_SIZE, 12)
 
+    def test_local_global_search_matches_title_source_and_filename(self):
+        item = app.Wallpaper("1", r"C:\\Wallpapers\\forest-night.jpg", "雨夜森林", source="本机元气缓存")
+        self.assertTrue(app.wallpaper_matches_query(item, "雨夜"))
+        self.assertTrue(app.wallpaper_matches_query(item, "元气 缓存"))
+        self.assertTrue(app.wallpaper_matches_query(item, "forest"))
+        self.assertFalse(app.wallpaper_matches_query(item, "海边"))
+
+    def test_resource_navigation_matches_yuanqi_order(self):
+        labels = [category.title for category in YuanqiResourceSource().list_categories()]
+        # 元气静态页只把这两个入口写在前端；其余导航由 cate_nav_v2 返回。
+        self.assertEqual(labels, ["关注", "精选"])
+
+    def test_unverified_synthetic_category_is_not_faked(self):
+        source = YuanqiResourceSource(lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"})
+        with self.assertRaises(CatalogError):
+            source.list_items("__ai__")
+
+    def test_app_builds_and_global_search_leaves_current_category(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            root.update_idletasks()
+            self.assertEqual(window._current_page, "wallpaper")
+            self.assertEqual(
+                [button.cget("text") for button in window.online_cate_buttons.values()],
+                ["关注", "精选"],
+            )
+            window.online_page = 4
+            window.global_search_var.set("雨夜")
+            with patch.object(window, "load_online_items") as load_online:
+                window.run_global_search()
+            self.assertEqual(window._current_page, "official")
+            self.assertEqual(window.online_cate_id, "__featured__")
+            self.assertEqual(window.online_page, 1)
+            self.assertEqual(window.online_query, "雨夜")
+            self.assertEqual(window.local_query, "雨夜")
+            load_online.assert_called_once_with("__featured__", 1, "雨夜")
+        finally:
+            root.destroy()
+
     def test_cache_discovery_rejects_empty_and_deduplicates_real_images(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -307,24 +349,77 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(CatalogError):
                 source.list_items("0", 1)
 
-    def test_resource_source_search_filters_cached_index(self):
+    def test_resource_source_search_uses_official_global_endpoint(self):
         def session(): return {"uid": "open-1", "token": "tok-1"}
         def device(): return {"deviceId": "dev-1"}
         source = YuanqiResourceSource(session, device)
         items = [
             {"id": "1", "wname": "海边落日", "jpg_url": "https://img-baofun.zhhainiao.com/a.jpg", "cid": 1, "cname": "风景"},
-            {"id": "2", "wname": "都市夜景", "jpg_url": "https://img-baofun.zhhainiao.com/b.jpg", "cid": 5, "cname": "美女"},
             {"id": "3", "wname": "海边小屋", "jpg_url": "https://img-baofun.zhhainiao.com/c.jpg", "cid": 1, "cname": "风景"},
         ]
         with patch("catalog.requests.post") as mock_post:
             mock_post.return_value.json.return_value = {
                 "resp_common": {"ret": 0},
-                "data": {"list": items, "total": 3},
+                "data": {"list": items, "total": 2},
             }
             page = source.search("海边")
+        url = mock_post.call_args.args[0]
+        body = mock_post.call_args.kwargs["json"]
+        self.assertTrue(url.endswith("/wallpaper/static/search"))
+        self.assertEqual(body["kw"], "海边")
+        self.assertEqual((body["page"], body["page_size"]), (1, 24))
         self.assertEqual(len(page.items), 2)
-        self.assertIn(page.items[0].title, ("海边落日", "海边小屋"))
         self.assertEqual(page.total, 2)
+
+    def test_resource_source_featured_uses_index_offset_strategy(self):
+        def session(): return {"uid": "open-1", "token": "tok-1"}
+        def device(): return {"deviceId": "dev-1"}
+        source = YuanqiResourceSource(session, device)
+        first = {"id": "310436", "wname": "自然景观", "jpg_url": "https://img-baofun.zhhainiao.com/a.jpg"}
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": [first], "total": 501,
+            }
+            page = source.list_items("__featured__", 2)
+        url = mock_post.call_args.args[0]
+        body = mock_post.call_args.kwargs["json"]
+        self.assertTrue(url.endswith("/wallpaper/static/index"))
+        self.assertEqual((body["count"], body["offset"]), (24, 24))
+        self.assertEqual(page.items[0].id, "310436")
+        self.assertEqual(page.total, 501)
+
+    def test_resource_source_categories_follow_server_order_and_id_kind(self):
+        def session(): return {"uid": "open-1", "token": "tok-1"}
+        def device(): return {"deviceId": "dev-1"}
+        source = YuanqiResourceSource(session, device)
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0},
+                "data": [
+                    {"tid": 93, "tname": "4k"},
+                    {"cid": 1, "cname": "风景"},
+                    {"cid": 8, "cname": "小清新"},
+                ],
+            }
+            categories = source.refresh_categories()
+        self.assertTrue(mock_post.call_args.args[0].endswith("/wallpaper/static/cate_nav_v2"))
+        self.assertEqual(
+            [(item.id, item.title) for item in categories],
+            [("__following__", "关注"), ("__featured__", "精选"),
+             ("tag:93", "4k"), ("cate:1", "风景"), ("cate:8", "小清新")],
+        )
+
+    def test_resource_source_category_defaults_to_hot_sort(self):
+        def session(): return {"uid": "open-1", "token": "tok-1"}
+        def device(): return {"deviceId": "dev-1"}
+        source = YuanqiResourceSource(session, device)
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": {"list": [], "total": 0},
+            }
+            source.list_items("tag:93", 1)
+        body = mock_post.call_args.kwargs["json"]
+        self.assertEqual((body["cate_id"], body["tag_id"], body["sort_type"]), (0, 93, 2))
 
     def test_session_store_round_trip_encrypted(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -83,7 +83,8 @@ SPI_SETDESKWALLPAPER = 20
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
 LOCAL_PAGE_SIZE = 12
-BG, PANEL, TEXT, MUTED, GOLD, PINK, LINE = "#f5f6fa", "#ffffff", "#1e2233", "#81879a", "#f4b734", "#fa6d9b", "#e9ebf1"
+BG, PANEL, TEXT, MUTED, GOLD, PINK, LINE = "#ffffff", "#ffffff", "#171b27", "#7d8493", "#ffc400", "#ff4f8b", "#edf0f4"
+NAV_BG, SOFT_BG, SELECT_BG = "#f3f4f6", "#f7f8fa", "#fff5cc"
 
 
 @dataclass
@@ -93,6 +94,15 @@ class Wallpaper:
     title: str
     favorite: bool = False
     source: str = "本地导入"
+
+
+def wallpaper_matches_query(item: Wallpaper, query: str) -> bool:
+    """本地图库搜索与顶栏全局搜索共用的匹配规则。"""
+    terms = tuple(part for part in query.casefold().split() if part)
+    if not terms:
+        return True
+    haystack = " ".join((item.title, item.source, Path(item.path).stem)).casefold()
+    return all(term in haystack for term in terms)
 
 
 def load_config() -> dict:
@@ -267,7 +277,7 @@ class App:
         self.online_photo_refs: list[ImageTk.PhotoImage] = []
         self.online_items: list[CatalogItem] = []
         self.online_selected_id: str | None = None
-        self.online_cate_id = "0"
+        self.online_cate_id = "__featured__"
         self.online_page = 1
         self.online_query = ""
         self.online_has_more = False
@@ -281,7 +291,9 @@ class App:
         threading.Thread(target=self._try_restore_session, daemon=True).start()
         self.items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
         self.filter_favorites = False
+        self.local_query = ""
         self.local_page = 0
+        self._current_page = "wallpaper"
         self.selected_id = self.config.get("last_applied") or (self.items[0].id if self.items else None)
         self.timer: threading.Timer | None = None
         self.status = tk.StringVar(value="本地 Windows 原生功能已就绪；元气账号尚未接入本客户端。")
@@ -292,57 +304,54 @@ class App:
         self._init_tray()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def button(self, parent, text, command, *, accent=False, width=None):
+    def button(self, parent, text, command, *, accent=False, width=None, compact=False):
         return tk.Button(parent, text=text, command=command, width=width, relief="flat", cursor="hand2",
-                         bg=GOLD if accent else "#f1f3f8", fg=TEXT, activebackground="#ffd56d" if accent else "#e4e8f0",
-                         activeforeground=TEXT, font=("Microsoft YaHei UI", 10, "bold"), padx=12, pady=8, bd=0)
+                         bg=GOLD if accent else NAV_BG, fg=TEXT, activebackground="#ffd84c" if accent else "#e8eaee",
+                         activeforeground=TEXT, font=("Microsoft YaHei UI", 10, "bold"),
+                         padx=10 if compact else 14, pady=5 if compact else 9, bd=0)
 
     def _build(self) -> None:
-        header = tk.Frame(self.root, bg=PANEL, height=78)
+        self.root.geometry("1280x820")
+        self.root.minsize(1060, 680)
+        header = tk.Frame(self.root, bg=PANEL, height=88)
         header.pack(fill="x"); header.pack_propagate(False)
-        tk.Label(header, text="桌面画廊", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 20, "bold")).pack(side="left", padx=(28, 8))
-        tk.Label(header, text="Windows 原生模式", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
-        nav = tk.Frame(header, bg="#f1f3f7"); nav.pack(side="left", padx=36, pady=15)
+        brand = tk.Frame(header, bg=PANEL); brand.pack(side="left", padx=(22, 18))
+        tk.Label(brand, text="桌面画廊", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
+        tk.Label(brand, text="Windows 原生模式", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 8, "bold")).pack(anchor="w")
+        nav = tk.Frame(header, bg=NAV_BG, padx=4, pady=4); nav.pack(side="left", pady=14)
         self.nav_buttons = {}
-        for key, label in (("wallpaper", "本地壁纸"), ("official", "资源接入"), ("theme", "电脑主题"), ("beauty", "系统美化"), ("components", "组件"), ("mine", "我的")):
+        for key, label in (("wallpaper", "静态壁纸"), ("official", "资源接入"), ("theme", "电脑主题"), ("beauty", "系统美化"), ("components", "组件"), ("mine", "我的")):
             button = tk.Button(nav, text=label, command=lambda name=key: self.show_page(name), relief="flat", cursor="hand2", bd=0,
-                               bg="#f1f3f7", fg=TEXT, activebackground=GOLD, font=("Microsoft YaHei UI", 10, "bold"), padx=16, pady=10)
-            button.pack(side="left", padx=2); self.nav_buttons[key] = button
-        self.button(header, "定时切换", self.open_settings).pack(side="right", padx=24)
+                               bg=NAV_BG, fg=TEXT, activebackground=GOLD, font=("Microsoft YaHei UI", 9, "bold"), padx=12, pady=12)
+            button.pack(side="left", padx=1); self.nav_buttons[key] = button
+
+        search_shell = tk.Frame(header, bg=PANEL, highlightbackground="#b9c0cc", highlightthickness=1)
+        search_shell.pack(side="right", padx=(10, 20), pady=23)
+        tk.Label(search_shell, text="全局", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 8, "bold")).pack(side="left", padx=(10, 0))
+        self.global_search_var = tk.StringVar()
+        self.global_search_entry = tk.Entry(search_shell, textvariable=self.global_search_var, width=16, relief="flat", bd=0,
+                                            bg=PANEL, fg=TEXT, insertbackground=TEXT,
+                                            font=("Microsoft YaHei UI", 10))
+        self.global_search_entry.pack(side="left", padx=(12, 4), ipady=5)
+        self.global_search_entry.bind("<Return>", lambda _event: self.run_global_search())
+        tk.Button(search_shell, text="⌕", command=self.run_global_search, relief="flat", bd=0, cursor="hand2",
+                  bg=PANEL, fg=MUTED, activebackground=PANEL, font=("Microsoft YaHei UI", 15, "bold"),
+                  padx=8, pady=0).pack(side="right")
 
         body = tk.Frame(self.root, bg=BG)
         self.library_page = body
-        sidebar = tk.Frame(body, bg=PANEL, width=180); sidebar.pack(side="left", fill="y", padx=(0, 18)); sidebar.pack_propagate(False)
-        tk.Label(sidebar, text="我的资料库", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=18, pady=(22, 10))
-        self.all_button = self.button(sidebar, "全部壁纸", self.show_all, width=13); self.all_button.pack(padx=16, pady=3)
-        self.favorite_button = self.button(sidebar, "我的收藏", self.show_favorites, width=13); self.favorite_button.pack(padx=16, pady=3)
-        tk.Frame(sidebar, bg=LINE, height=1).pack(fill="x", padx=18, pady=20)
-        tk.Label(sidebar, text="资源来源", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=18)
-        tk.Label(sidebar, text="· 本地导入\n· 官网 5 张公开样图\n· 已授权图片直链", justify="left", bg=PANEL, fg=TEXT,
-                 font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w", padx=18)
-        self.button(sidebar, "打开元气官网", self.open_official_site, width=13).pack(side="bottom", pady=18)
+        main = tk.Frame(body, bg=BG); main.pack(fill="both", expand=True)
+        local_tabs = tk.Frame(main, bg=BG); local_tabs.pack(fill="x", pady=(1, 8))
+        self.all_button = self.button(local_tabs, "全部", self.show_all, compact=True); self.all_button.pack(side="left", padx=(0, 4))
+        self.favorite_button = self.button(local_tabs, "收藏", self.show_favorites, compact=True); self.favorite_button.pack(side="left", padx=4)
+        tk.Label(local_tabs, text="本机静态图库", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=10)
 
-        main = tk.Frame(body, bg=BG); main.pack(side="left", fill="both", expand=True)
-        preview = tk.Frame(main, bg=PANEL, height=280); preview.pack(fill="x"); preview.pack_propagate(False)
-        self.preview_image = tk.Label(preview, bg="#d8dce6"); self.preview_image.pack(side="left", fill="both", expand=True, padx=16, pady=16)
-        detail = tk.Frame(preview, bg=PANEL, width=260); detail.pack(side="right", fill="y", padx=(0, 26), pady=26); detail.pack_propagate(False)
-        tk.Label(detail, text="当前预览", bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        self.preview_title = tk.Label(detail, text="选择一张壁纸", bg=PANEL, fg=TEXT, wraplength=230, justify="left", font=("Microsoft YaHei UI", 18, "bold"), pady=8)
-        self.preview_title.pack(anchor="w")
-        self.preview_source = tk.Label(detail, text="", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)); self.preview_source.pack(anchor="w")
-        self.apply_button = self.button(detail, "应用为壁纸", self.apply_selected, accent=True); self.apply_button.pack(anchor="w", pady=(20, 7))
-        self.favorite_action = self.button(detail, "收藏这张", self.toggle_selected_favorite); self.favorite_action.pack(anchor="w")
-
-        gallery_header = tk.Frame(main, bg=BG); gallery_header.pack(fill="x", pady=(18, 8))
-        tk.Label(gallery_header, text="本地壁纸库", bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(side="left")
+        gallery_header = tk.Frame(main, bg=BG); gallery_header.pack(fill="x", pady=(0, 7))
         self.count_label = tk.Label(gallery_header, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9)); self.count_label.pack(side="left", padx=10)
-        self.button(gallery_header, "导入", self.import_images).pack(side="right", padx=3)
-        self.button(gallery_header, "直链下载", self.download_url).pack(side="right", padx=3)
-        self.button(gallery_header, "同步 5 张公开样图", self.sync_official_featured).pack(side="right", padx=3)
-        self.button(gallery_header, "下一页", self.next_local_page).pack(side="right", padx=(12, 3))
+        self.button(gallery_header, "下一页", self.next_local_page, compact=True).pack(side="right", padx=(8, 2))
         self.local_page_label = tk.Label(gallery_header, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9))
         self.local_page_label.pack(side="right", padx=5)
-        self.button(gallery_header, "上一页", self.previous_local_page).pack(side="right", padx=3)
+        self.button(gallery_header, "上一页", self.previous_local_page, compact=True).pack(side="right", padx=2)
         self.gallery_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(main, orient="vertical", command=self.gallery_canvas.yview)
         self.gallery_canvas.configure(yscrollcommand=scrollbar.set)
@@ -351,27 +360,111 @@ class App:
         self.gallery_window = self.gallery_canvas.create_window((0, 0), window=self.gallery, anchor="nw")
         self.gallery.bind("<Configure>", lambda _event: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all")))
         self.gallery_canvas.bind("<Configure>", lambda event: self.gallery_canvas.itemconfigure(self.gallery_window, width=event.width))
-        self.root.bind_all("<MouseWheel>", lambda event: self.gallery_canvas.yview_scroll(int(-event.delta / 120), "units"))
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
         self.theme_page = self.build_theme_page()
         self.official_page = self.build_official_page()
         self.beauty_page = self.build_beauty_page()
         self.components_page = self.build_components_page()
         self.mine_page = self.build_mine_page()
         self.pages = {"wallpaper": self.library_page, "official": self.official_page, "theme": self.theme_page, "beauty": self.beauty_page, "components": self.components_page, "mine": self.mine_page}
+
+        action_bar = tk.Frame(self.root, bg=PANEL, height=58, highlightbackground=LINE, highlightthickness=1)
+        action_bar.pack(fill="x", side="bottom"); action_bar.pack_propagate(False)
+        self.button(action_bar, "▶  自动换壁纸", self.open_settings, accent=True, compact=True).pack(side="left", padx=(18, 8), pady=10)
+        self.button(action_bar, "▧  导入壁纸", self.import_images, compact=True).pack(side="left", padx=4, pady=10)
+        self.button(action_bar, "直链下载", self.download_url, compact=True).pack(side="left", padx=4, pady=10)
+        self.button(action_bar, "同步公开样图", self.sync_official_featured, compact=True).pack(side="left", padx=4, pady=10)
+        self.local_action_group = tk.Frame(action_bar, bg=PANEL)
+        self.local_action_group.pack(side="right", padx=14, pady=8)
+        self.favorite_action = self.button(self.local_action_group, "☆  收藏", self.toggle_selected_favorite, compact=True)
+        self.favorite_action.pack(side="left", padx=4)
+        self.apply_button = self.button(self.local_action_group, "设为壁纸", self.apply_selected, accent=True, compact=True)
+        self.apply_button.pack(side="left", padx=4)
+        self.online_action_group = tk.Frame(action_bar, bg=PANEL)
+        self.online_download_button = self.button(self.online_action_group, "下载到本地", self.download_online_selected, compact=True)
+        self.online_download_button.pack(side="left", padx=4)
+        self.online_apply_button = self.button(self.online_action_group, "下载并设为壁纸", self.apply_online_selected, accent=True, compact=True)
+        self.online_apply_button.pack(side="left", padx=4)
+
         tk.Label(self.root, textvariable=self.status, bg="#eef0f5", fg="#53607a", anchor="w", padx=24, pady=10,
                  font=("Microsoft YaHei UI", 9)).pack(fill="x", side="bottom")
         self.show_page("wallpaper")
 
     def show_page(self, name: str) -> None:
+        self._current_page = name
         for page in self.pages.values(): page.pack_forget()
-        self.pages[name].pack(fill="both", expand=True, padx=22, pady=18)
+        self.pages[name].pack(fill="both", expand=True, padx=18, pady=(4, 8))
         for key, button in self.nav_buttons.items():
-            button.configure(bg=GOLD if key == name else "#f1f3f7")
+            button.configure(bg=GOLD if key == name else NAV_BG)
+        self.local_action_group.pack_forget()
+        self.online_action_group.pack_forget()
+        if name == "wallpaper":
+            self.local_action_group.pack(side="right", padx=14, pady=8)
+        elif name == "official":
+            self.online_action_group.pack(side="right", padx=14, pady=8)
         if name == "theme": self.refresh_theme_preview()
         if name == "mine": self.refresh_mine_summary()
         if name == "official":
             self.login_status.configure(text=self._login_status_text())
             self.load_online_items(self.online_cate_id, self.online_page, self.online_query)
+
+    def _on_mousewheel(self, event) -> None:
+        """按当前活动页面把滚轮路由到对应 canvas，避免本地/联网图库滚轮错位。"""
+        delta = int(-event.delta / 120)
+        canvas = getattr(self, "online_canvas", None) if self._current_page == "official" else getattr(self, "gallery_canvas", None)
+        if canvas is not None:
+            canvas.yview_scroll(delta, "units")
+
+    def run_global_search(self) -> None:
+        """从任意主分区进入统一结果页；搜索不继承当前分类。"""
+        query = self.global_search_var.get().strip()
+        if not query:
+            self.clear_search()
+            self.global_search_entry.focus_set()
+            self.status.set("请输入壁纸名称、分类、作者或来源关键词。")
+            return
+        self.local_query = query
+        self.filter_favorites = False
+        self.local_page = 0
+        self.search_var.set(query)
+        self.online_query = query
+        self.online_cate_id = "__featured__"
+        self.online_page = 1
+        self.render_global_local_matches(query)
+        self.show_page("official")
+        self.status.set(f"正在全局搜索“{query}”：本地图库 + 元气联网全部分类。")
+
+    def render_global_local_matches(self, query: str) -> None:
+        if not hasattr(self, "global_local_results"):
+            return
+        for child in self.global_local_results.winfo_children():
+            child.destroy()
+        matches = [item for item in self.items if wallpaper_matches_query(item, query)]
+        if not query:
+            self.global_local_results.pack_forget()
+            return
+        self.global_local_results.pack(fill="x", pady=(0, 8), before=self.online_body)
+        tk.Label(self.global_local_results, text=f"本地匹配  {len(matches)} 张", bg=SOFT_BG, fg=TEXT,
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", padx=(12, 10), pady=8)
+        for item in matches[:5]:
+            tk.Button(self.global_local_results, text=item.title, command=lambda current=item: self.open_local_search_result(current),
+                      relief="flat", bd=0, cursor="hand2", bg=PANEL, fg=TEXT, activebackground=SELECT_BG,
+                      font=("Microsoft YaHei UI", 9), padx=10, pady=5).pack(side="left", padx=3, pady=6)
+        if len(matches) > 5:
+            tk.Label(self.global_local_results, text=f"另有 {len(matches) - 5} 张", bg=SOFT_BG, fg=MUTED,
+                     font=("Microsoft YaHei UI", 9)).pack(side="left", padx=8)
+
+    def open_local_search_result(self, item: Wallpaper) -> None:
+        self.selected_id = item.id
+        self.local_query = self.global_search_var.get().strip()
+        matches = [entry for entry in self.visible_items()]
+        try:
+            index = next(index for index, entry in enumerate(matches) if entry.id == item.id)
+        except StopIteration:
+            index = 0
+        self.local_page = index // LOCAL_PAGE_SIZE
+        self.show_page("wallpaper")
+        self.refresh()
 
     def page_header(self, page: tk.Frame, title: str, description: str) -> None:
         tk.Label(page, text=title, bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 21, "bold")).pack(anchor="w", pady=(6, 2))
@@ -412,44 +505,41 @@ class App:
 
     def build_official_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG)
-        self.page_header(page, "元气资源", "登录后可浏览、下载并应用元气桌面联网壁纸。")
+        category_row = tk.Frame(page, bg=BG); category_row.pack(fill="x", pady=(2, 5))
+        self.online_category_row = category_row
+        self.online_cate_buttons: dict[str, tk.Button] = {}
+        self._render_online_categories(self.yuanqi_source.list_categories())
 
-        status_bar = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=16, pady=10)
-        status_bar.pack(fill="x", pady=(0, 8))
-        self.login_status = tk.Label(status_bar, text=self._login_status_text(), bg=PANEL, fg=PINK,
-                                     font=("Microsoft YaHei UI", 10, "bold"))
+        account_row = tk.Frame(page, bg=BG); account_row.pack(fill="x", pady=(0, 6))
+        self.login_status = tk.Label(account_row, text=self._login_status_text(), bg=BG, fg=PINK,
+                                     font=("Microsoft YaHei UI", 9, "bold"))
         self.login_status.pack(side="left")
-        status_actions = tk.Frame(status_bar, bg=PANEL); status_actions.pack(side="right")
-        self.button(status_actions, "微信扫码登录", self.start_wechat_login, accent=True).pack(side="left", padx=(0, 6))
+        tk.Label(account_row, text="搜索范围：本地图库 + 元气联网全部分类", bg=BG, fg=MUTED,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=14)
+        status_actions = tk.Frame(account_row, bg=BG); status_actions.pack(side="right")
+        self.button(status_actions, "微信扫码登录", self.start_wechat_login, accent=True, compact=True).pack(side="left", padx=(0, 6))
         self.logout_button = self.button(status_actions, "退出登录", self.logout_wechat)
         self.logout_button.pack(side="left", padx=(0, 6))
         self.logout_button.configure(state="disabled" if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED else "normal")
 
-        cate_bar = tk.Frame(page, bg=BG); cate_bar.pack(fill="x", pady=(0, 6))
-        self.online_cate_buttons: dict[str, tk.Button] = {}
-        for cat in self.yuanqi_source.list_categories():
-            button = self.button(cate_bar, cat.title, lambda c=cat.id: self._switch_online_category(c))
-            button.pack(side="left", padx=2, pady=2)
-            self.online_cate_buttons[cat.id] = button
+        self.search_var = self.global_search_var
+        self.online_search_hint = tk.Label(account_row, text="", bg=BG, fg=PINK, font=("Microsoft YaHei UI", 9, "bold"))
+        self.online_search_hint.pack(side="left", padx=10)
+        self.cache_status = tk.Label(account_row, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 8))
+        self.cache_status.pack(side="left", padx=6)
+        self.button(status_actions, "迁移缓存", self.import_detected_yuanqi_cache, compact=True).pack(side="left", padx=(0, 4))
+        self.button(status_actions, "选择目录", self.choose_yuanqi_cache_directory, compact=True).pack(side="left", padx=(0, 4))
+        self.button(status_actions, "官网", self.open_official_site, compact=True).pack(side="left", padx=(0, 4))
 
-        search_bar = tk.Frame(page, bg=BG); search_bar.pack(fill="x", pady=(0, 6))
-        self.search_var = tk.StringVar()
-        search_entry = tk.Entry(search_bar, textvariable=self.search_var, width=30, relief="solid", bd=1,
-                                font=("Microsoft YaHei UI", 10))
-        search_entry.pack(side="left", padx=(0, 6), ipady=4)
-        search_entry.bind("<Return>", lambda _event: self.search_online())
-        self.button(search_bar, "搜索", self.search_online, accent=True).pack(side="left", padx=(0, 6))
-        self.button(search_bar, "清除", self.clear_search).pack(side="left")
-        self.online_search_hint = tk.Label(search_bar, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9))
-        self.online_search_hint.pack(side="left", padx=12)
-
+        self.global_local_results = tk.Frame(page, bg=SOFT_BG)
         body = tk.Frame(page, bg=BG); body.pack(fill="both", expand=True)
+        self.online_body = body
         grid_pane = tk.Frame(body, bg=BG); grid_pane.pack(side="left", fill="both", expand=True)
         top = tk.Frame(grid_pane, bg=BG); top.pack(fill="x", pady=(0, 6))
         self.online_page_label = tk.Label(top, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9))
         self.online_page_label.pack(side="left")
-        self.button(top, "下一页", lambda: self.load_online_items(self.online_cate_id, self.online_page + 1)).pack(side="right", padx=2)
-        self.button(top, "上一页", lambda: self.load_online_items(self.online_cate_id, max(1, self.online_page - 1))).pack(side="right", padx=2)
+        self.button(top, "下一页", lambda: self.load_online_items(self.online_cate_id, self.online_page + 1, self.online_query), compact=True).pack(side="right", padx=2)
+        self.button(top, "上一页", lambda: self.load_online_items(self.online_cate_id, max(1, self.online_page - 1), self.online_query), compact=True).pack(side="right", padx=2)
 
         self.online_canvas = tk.Canvas(grid_pane, bg=BG, highlightthickness=0)
         online_scroll = tk.Scrollbar(grid_pane, orient="vertical", command=self.online_canvas.yview)
@@ -460,34 +550,54 @@ class App:
         self.online_grid.bind("<Configure>", lambda _event: self.online_canvas.configure(scrollregion=self.online_canvas.bbox("all")))
         self.online_canvas.bind("<Configure>", lambda event: self.online_canvas.itemconfigure(self.online_grid_window, width=event.width))
 
-        preview = tk.Frame(body, bg=PANEL, width=300); preview.pack(side="right", fill="y", padx=(12, 0)); preview.pack_propagate(False)
-        self.online_preview_image = tk.Label(preview, bg="#d8dce6"); self.online_preview_image.pack(fill="both", expand=True, padx=14, pady=14)
-        self.online_preview_title = tk.Label(preview, text="选择一张壁纸", bg=PANEL, fg=TEXT, wraplength=260, font=("Microsoft YaHei UI", 14, "bold"))
-        self.online_preview_title.pack(anchor="w", padx=14)
-        self.online_preview_meta = tk.Label(preview, text="", bg=PANEL, fg=MUTED, wraplength=260, justify="left", font=("Microsoft YaHei UI", 9))
-        self.online_preview_meta.pack(anchor="w", padx=14, pady=4)
-        self.button(preview, "下载到本地图库", self.download_online_selected, accent=True).pack(anchor="w", padx=14, pady=(12, 5))
-        self.button(preview, "下载并应用为壁纸", self.apply_online_selected).pack(anchor="w", padx=14)
-        self.button(preview, "查看大图", self.show_online_detail).pack(anchor="w", padx=14, pady=(8, 0))
-
-        self.load_online_items("0", 1)
+        self.load_online_items("__featured__", 1)
         return page
 
+    def _render_online_categories(self, categories) -> None:
+        """用静态资源服务返回的导航顺序重绘分类栏。"""
+        for child in self.online_category_row.winfo_children():
+            child.destroy()
+        self.online_cate_buttons = {}
+        for cat in categories:
+            button = tk.Button(
+                self.online_category_row,
+                text=cat.title,
+                command=lambda c=cat.id: self._switch_online_category(c),
+                relief="flat",
+                cursor="hand2",
+                bd=0,
+                bg=BG,
+                fg=TEXT,
+                activebackground=SELECT_BG,
+                font=("Microsoft YaHei UI", 10, "bold"),
+                padx=10,
+                pady=6,
+            )
+            button.pack(side="left", padx=1)
+            self.online_cate_buttons[cat.id] = button
+        for cid, button in self.online_cate_buttons.items():
+            selected = not self.online_query and cid == self.online_cate_id
+            button.configure(bg=PINK if selected else BG, fg=PANEL if selected else TEXT)
+
     def _switch_online_category(self, cate_id: str) -> None:
-        self.search_var.set("")
+        self.global_search_var.set("")
+        self.local_query = ""
         self.online_query = ""
         self.online_search_hint.configure(text="")
+        self.render_global_local_matches("")
         self.load_online_items(cate_id, 1)
 
     def search_online(self) -> None:
-        self.online_query = self.search_var.get().strip()
-        self.load_online_items(self.online_cate_id, 1, self.online_query)
+        self.run_global_search()
 
-    def clear_search(self) -> None:
-        self.search_var.set("")
+    def clear_search(self, *, load_online: bool = True) -> None:
+        self.global_search_var.set("")
+        self.local_query = ""
         self.online_query = ""
         self.online_search_hint.configure(text="")
-        self.load_online_items(self.online_cate_id, 1)
+        self.render_global_local_matches("")
+        if load_online:
+            self.load_online_items(self.online_cate_id, 1)
 
     def _safe_after(self, callback) -> None:
         """从后台线程把 UI 更新投递到主线程队列；线程安全。"""
@@ -558,10 +668,12 @@ class App:
         self.wechat_backend.clear()
         self.yuanqi_auth.clear()
         clear_session()
+        self.yuanqi_source.reset_session_cache()
+        self._online_cache.clear()
         self.online_selected_id = None
         self.login_status.configure(text=self._login_status_text())
         self.logout_button.configure(state="disabled")
-        self.load_online_items("0", 1)
+        self.load_online_items("__featured__", 1)
         self.status.set("已退出本客户端登录态；官方客户端登录不受影响。")
 
     def _try_restore_session(self) -> None:
@@ -583,7 +695,8 @@ class App:
     def _on_session_restored(self) -> None:
         self.login_status.configure(text=self._login_status_text())
         self.logout_button.configure(state="normal")
-        self.load_online_items("0", 1)
+        self._online_cache.clear()
+        self.load_online_items("__featured__", 1)
         self.status.set("已从本地加密会话恢复登录状态。")
 
 
@@ -591,9 +704,10 @@ class App:
         self.online_cate_id = cate_id
         self.online_page = page
         self.online_query = query
-        self.online_search_hint.configure(text=f"搜索：{query}" if query else "")
+        self.online_search_hint.configure(text=f"全局搜索：{query}" if query else "")
         for cid, button in self.online_cate_buttons.items():
-            button.configure(bg="#fff3cf" if cid == cate_id else "#f1f3f8")
+            selected = not query and cid == cate_id
+            button.configure(bg=PINK if selected else BG, fg=PANEL if selected else TEXT)
         self._clear_online_grid()
         if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED:
             self.online_page_label.configure(text="")
@@ -611,12 +725,10 @@ class App:
 
     def _fetch_online(self, cate_id: str, page: int, query: str) -> None:
         try:
+            categories = self.yuanqi_source.refresh_categories()
+            self._safe_after(lambda current=categories: self._render_online_categories(current))
             if query:
-                def progress(count: int, cur_page: int) -> None:
-                    self._safe_after(lambda: self.online_page_label.configure(
-                        text=f"正在同步全站索引：已 {count} 条（第 {cur_page} 页）……"))
-
-                result = self.yuanqi_source.search(query, page, progress_cb=progress)
+                result = self.yuanqi_source.search(query, page)
             else:
                 result = self.yuanqi_source.list_items(cate_id, page)
             self._online_cache[(cate_id, page, query)] = result
@@ -636,10 +748,19 @@ class App:
         self.online_has_more = result.has_more
         self.online_total = result.total
         if self.online_query:
-            label = f"搜索“{self.online_query}”：共 {result.total or '?'} 条 · 第 {self.online_page} 页"
+            local_count = sum(wallpaper_matches_query(item, self.online_query) for item in self.items)
+            label = f"全局结果：本地 {local_count} 张 · 联网 {result.total or 0} 张 · 第 {self.online_page} 页"
         else:
             label = f"第 {self.online_page} 页 · 共 {result.total or '?'} 条"
         self.online_page_label.configure(text=label)
+        if not self.online_items:
+            if self.online_query:
+                self._online_grid_message("联网全部分类中没有匹配结果；上方仍会保留本地图库匹配。")
+            else:
+                title = next((cat.title for cat in self.yuanqi_source.list_categories() if cat.id == self.online_cate_id), "当前分类")
+                self._online_grid_message(f"{title}暂无可验证的匹配资源；桌面画廊不会用模拟数据补齐。")
+            self.status.set("当前筛选没有可验证结果。")
+            return
         self._render_online_grid_batched(0)
         self.online_canvas.yview_moveto(0)
         if self.online_items:
@@ -665,9 +786,9 @@ class App:
         self.online_photo_refs.clear()
         self.online_items = []
         self.online_selected_id = None
-        self.online_preview_title.configure(text="选择一张壁纸")
-        self.online_preview_meta.configure(text="")
-        self.online_preview_image.configure(image="")
+        if hasattr(self, "online_download_button"):
+            self.online_download_button.configure(state="disabled")
+            self.online_apply_button.configure(state="disabled")
 
     def _render_online_grid_batched(self, start: int = 0) -> None:
         batch = 6
@@ -675,7 +796,7 @@ class App:
         for index in range(start, end):
             item = self.online_items[index]
             card = self._online_card(item)
-            card.grid(row=index // 3, column=index % 3, padx=6, pady=6, sticky="nsew")
+            card.grid(row=index // 3, column=index % 3, padx=5, pady=5, sticky="nsew")
             self.online_grid.grid_columnconfigure(index % 3, weight=1)
             self._online_card_widgets[item.id] = card
         if end < len(self.online_items):
@@ -685,15 +806,18 @@ class App:
 
     def _online_card(self, item: CatalogItem) -> tk.Frame:
         selected = item.id == self.online_selected_id
-        card = tk.Frame(self.online_grid, bg=PANEL, highlightbackground=GOLD if selected else LINE,
-                        highlightthickness=2 if selected else 1, cursor="hand2")
-        photo = self.online_thumbnail_for(item, (200, 120)); self.online_photo_refs.append(photo)
-        picture = tk.Label(card, image=photo, bg=PANEL, cursor="hand2"); picture.pack(fill="x", padx=6, pady=(6, 4))
-        name = tk.Label(card, text=item.title, bg=PANEL, fg=TEXT, anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
-        name.pack(fill="x", padx=8)
-        meta = tk.Label(card, text=(item.category_name or "精选") + (" · " + item.author if item.author else ""),
-                        bg=PANEL, fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 8))
-        meta.pack(fill="x", padx=8, pady=(2, 6))
+        card = tk.Frame(self.online_grid, bg=PANEL, highlightbackground=GOLD if selected else PANEL,
+                        highlightthickness=3 if selected else 0, cursor="hand2")
+        photo = self.online_thumbnail_for(item, (380, 214)); self.online_photo_refs.append(photo)
+        picture = tk.Label(card, image=photo, bg=PANEL, cursor="hand2", bd=0); picture.pack(fill="x")
+        name = tk.Label(picture, text=item.title, bg="#20232a", fg="#ffffff", anchor="w",
+                        font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3)
+        name.place(x=8, y=8)
+        meta_text = item.category_name or "精选"
+        if item.resolution:
+            meta_text += " · " + item.resolution
+        meta = tk.Label(card, text=meta_text, bg=PANEL, fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 8))
+        meta.pack(fill="x", padx=3, pady=(4, 2))
         for widget in (card, picture, name, meta):
             widget.bind("<Button-1>", lambda _event, current=item: self.select_online(current))
             widget.bind("<Double-Button-1>", lambda _event, current=item: self.show_online_detail(current))
@@ -702,7 +826,7 @@ class App:
     def _update_online_borders(self) -> None:
         for item_id, card in self._online_card_widgets.items():
             sel = item_id == self.online_selected_id
-            card.configure(highlightbackground=GOLD if sel else LINE, highlightthickness=2 if sel else 1)
+            card.configure(highlightbackground=GOLD if sel else PANEL, highlightthickness=3 if sel else 0)
 
     def online_thumbnail_for(self, item: CatalogItem, size: tuple[int, int]) -> ImageTk.PhotoImage:
         raw = self._thumb_cache.get(item.preview_url)
@@ -728,11 +852,10 @@ class App:
     def select_online(self, item: CatalogItem) -> None:
         self.online_selected_id = item.id
         self._update_online_borders()
-        photo = self.online_thumbnail_for(item, (260, 150)); self.online_photo_refs.append(photo)
-        self.online_preview_image.configure(image=photo)
-        self.online_preview_title.configure(text=item.title)
-        meta = " · ".join(part for part in (item.category_name, item.author, item.resolution, item.format) if part)
-        self.online_preview_meta.configure(text=meta or "元气桌面联网壁纸")
+        if hasattr(self, "online_download_button"):
+            self.online_download_button.configure(state="normal")
+            self.online_apply_button.configure(state="normal")
+        self.status.set(f"已选择：{item.title}；双击卡片可查看大图。")
 
     def show_online_detail(self, item: CatalogItem | None = None) -> None:
         item = item or self.selected_online()
@@ -902,7 +1025,9 @@ class App:
         self.status.set("微信登录成功：账号、设备与资源服务会话均已由服务端校验。")
         self.login_status.configure(text=self._login_status_text())
         self.logout_button.configure(state="normal")
-        self.load_online_items("0", 1)
+        self.yuanqi_source.reset_session_cache()
+        self._online_cache.clear()
+        self.load_online_items("__featured__", 1)
         messagebox.showinfo("登录成功", "已用微信扫码登录元气账号，并已加密保存在本机。\n下次启动将自动保持登录。")
 
     def show_yuanqi_auth_status(self) -> None:
@@ -1003,7 +1128,10 @@ class App:
             messagebox.showerror("开机自启", "无法写入 HKCU 启动项，请检查权限。")
 
     def visible_items(self) -> list[Wallpaper]:
-        return [item for item in self.items if item.favorite or not self.filter_favorites]
+        return [
+            item for item in self.items
+            if (item.favorite or not self.filter_favorites) and wallpaper_matches_query(item, self.local_query)
+        ]
 
     def persist(self) -> None:
         self.config["items"] = [asdict(item) for item in self.items]
@@ -1037,39 +1165,43 @@ class App:
         for child in self.gallery.winfo_children(): child.destroy()
         for index, item in enumerate(items):
             selected = item.id == self.selected_id
-            card = tk.Frame(self.gallery, bg=PANEL, highlightbackground=GOLD if selected else LINE,
-                            highlightthickness=2 if selected else 1, cursor="hand2")
-            card.grid(row=index // 3, column=index % 3, padx=7, pady=7, sticky="nsew")
+            card = tk.Frame(self.gallery, bg=PANEL, highlightbackground=GOLD if selected else PANEL,
+                            highlightthickness=3 if selected else 0, cursor="hand2")
+            card.grid(row=index // 3, column=index % 3, padx=5, pady=5, sticky="nsew")
             self.gallery.grid_columnconfigure(index % 3, weight=1)
-            photo = self.image_for(Path(item.path), (220, 128)); self.photo_refs.append(photo)
-            picture = tk.Label(card, image=photo, bg=PANEL, cursor="hand2"); picture.pack(fill="x", padx=8, pady=(8, 6))
-            title = tk.Label(card, text=item.title, bg=PANEL, fg=TEXT, anchor="w", cursor="hand2", font=("Microsoft YaHei UI", 10, "bold"))
-            title.pack(fill="x", padx=9)
-            meta = tk.Label(card, text=("★ 收藏 · " if item.favorite else "") + item.source, bg=PANEL, fg=MUTED, anchor="w", cursor="hand2", font=("Microsoft YaHei UI", 8), pady=7)
-            meta.pack(fill="x", padx=9)
+            photo = self.image_for(Path(item.path), (380, 214)); self.photo_refs.append(photo)
+            picture = tk.Label(card, image=photo, bg=PANEL, cursor="hand2", bd=0); picture.pack(fill="x")
+            title = tk.Label(picture, text=item.title, bg="#20232a", fg="#ffffff", anchor="w", cursor="hand2",
+                             font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3)
+            title.place(x=8, y=8)
+            meta = tk.Label(card, text=("★  " if item.favorite else "") + item.source, bg=PANEL, fg=MUTED,
+                            anchor="w", cursor="hand2", font=("Microsoft YaHei UI", 8), pady=3)
+            meta.pack(fill="x", padx=3)
             for widget in (card, picture, title, meta): widget.bind("<Button-1>", lambda _event, current=item: self.select(current))
-        self.count_label.configure(text=f"{len(filtered_items)} 张静态壁纸")
+        scope = f"搜索“{self.local_query}” · " if self.local_query else ""
+        self.count_label.configure(text=f"{scope}{len(filtered_items)} 张静态壁纸")
         self.local_page_label.configure(text=f"第 {self.local_page + 1} / {page_count} 页")
         item = self.selected()
         if item:
-            photo = self.image_for(Path(item.path), (470, 248)); self.photo_refs.append(photo)
-            self.preview_image.configure(image=photo)
-            self.preview_title.configure(text=item.title)
-            self.preview_source.configure(text=item.source)
-            self.favorite_action.configure(text="取消收藏" if item.favorite else "收藏这张")
+            self.favorite_action.configure(text="★  取消收藏" if item.favorite else "☆  收藏")
             self.apply_button.configure(state="normal")
+            self.status.set(f"已选择：{item.title} · {item.source}")
         else:
-            self.preview_image.configure(image="")
-            self.preview_title.configure(text="还没有壁纸")
-            self.preview_source.configure(text="导入图片或同步官网精选开始浏览")
             self.apply_button.configure(state="disabled")
-        self.all_button.configure(bg="#fff3cf" if not self.filter_favorites else "#f1f3f8")
-        self.favorite_button.configure(bg="#fff3cf" if self.filter_favorites else "#f1f3f8")
+            self.favorite_action.configure(state="disabled")
+        if item:
+            self.favorite_action.configure(state="normal")
+        self.all_button.configure(bg=PINK if not self.filter_favorites else BG, fg=PANEL if not self.filter_favorites else TEXT)
+        self.favorite_button.configure(bg=PINK if self.filter_favorites else BG, fg=PANEL if self.filter_favorites else TEXT)
         self.persist()
         self.root.after_idle(lambda: self.gallery_canvas.yview_moveto(0))
 
     def show_all(self) -> None:
-        self.filter_favorites = False; self.local_page = 0; self.refresh()
+        self.filter_favorites = False
+        self.local_query = ""
+        self.global_search_var.set("")
+        self.local_page = 0
+        self.refresh()
 
     def previous_local_page(self) -> None:
         if self.local_page > 0:
@@ -1134,7 +1266,11 @@ class App:
         self.mine_summary.configure(text=f"本地资料库\n\n{len(self.items)} 张静态壁纸\n{favorites} 张收藏\n{online_downloaded} 张联网下载\n\n元气账号\n{account}\n\n主题文件\n{self.theme_path()}\n\n资源全部存放在本机，会话令牌只驻留内存，不保存元气 Cookie 或令牌。")
 
     def show_favorites(self) -> None:
-        self.filter_favorites = True; self.local_page = 0; self.refresh()
+        self.filter_favorites = True
+        self.local_query = ""
+        self.global_search_var.set("")
+        self.local_page = 0
+        self.refresh()
 
     def add_file(self, source: Path, source_name: str = "本地导入") -> None:
         if source.suffix.lower() not in IMAGE_EXTENSIONS: raise ValueError("只接受 BMP、JPG、JPEG、PNG 静态图片")

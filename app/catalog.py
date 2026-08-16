@@ -17,9 +17,14 @@ from PIL import Image
 
 
 CATALOG_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/list"
+INDEX_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/index"
+SEARCH_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/search"
+CATEGORY_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/cate_nav_v2"
+FOLLOWING_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/following/list"
 SUGGEST_URL = "https://pcwallpaper.zhhainiao.com/v1/suggestion/suggest"
 PAGE_SIZE = 24
-FULL_INDEX_PAGE_SIZE = 50
+SORT_HOT_DESC = 2
+SORT_TIME_DESC = 1
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 RESOURCE_IMAGE_HOSTS = {
     "img-baofun.zhhainiao.com",
@@ -115,21 +120,9 @@ def validate_resource_image_url(url: str) -> str:
 class YuanqiResourceSource:
     """使用自研扫码会话访问元气 PC 静态壁纸资源。"""
 
-    _CATEGORIES = (
-        CatalogCategory("0", "精选"),
-        CatalogCategory("__4k__", "4K"),
-        CatalogCategory("1", "风景"),
-        CatalogCategory("8", "小清新"),
-        CatalogCategory("2", "动漫"),
-        CatalogCategory("6", "明星"),
-        CatalogCategory("5", "美女"),
-        CatalogCategory("9", "科幻"),
-        CatalogCategory("7", "动物"),
-        CatalogCategory("4", "游戏"),
-        CatalogCategory("12", "体育"),
-        CatalogCategory("10", "汽车"),
-        CatalogCategory("11", "军事"),
-        CatalogCategory("13", "其他"),
+    _SPECIAL_CATEGORIES = (
+        CatalogCategory("__following__", "关注"),
+        CatalogCategory("__featured__", "精选"),
     )
 
     def __init__(
@@ -143,8 +136,8 @@ class YuanqiResourceSource:
         self._device_provider = device_provider
         self._http = http
         self._items_by_id: dict[str, CatalogItem] = {}
-        self._full_index: tuple[CatalogItem, ...] | None = None
-        self._index_lock = threading.Lock()
+        self._server_categories: tuple[CatalogCategory, ...] | None = None
+        self._category_lock = threading.Lock()
 
     def capabilities(self) -> SourceCapabilities:
         configured = self._session_provider is not None and self._device_provider is not None
@@ -163,7 +156,43 @@ class YuanqiResourceSource:
         return "wechat_qr"
 
     def list_categories(self) -> tuple[CatalogCategory, ...]:
-        return self._CATEGORIES
+        return self._SPECIAL_CATEGORIES + (self._server_categories or ())
+
+    def refresh_categories(self) -> tuple[CatalogCategory, ...]:
+        """读取元气静态页的服务端导航，保留其顺序与 cid/tid 语义。"""
+        if self._server_categories is not None:
+            return self.list_categories()
+        with self._category_lock:
+            if self._server_categories is not None:
+                return self.list_categories()
+            payload = self._post(CATEGORY_URL, {"login_info": {}, "common": self._common()})
+            raw_categories = payload.get("data") or []
+            if not isinstance(raw_categories, list):
+                raise CatalogError("分类导航结构错误")
+            categories: list[CatalogCategory] = []
+            seen: set[str] = set()
+            for raw in raw_categories:
+                if not isinstance(raw, Mapping):
+                    continue
+                if raw.get("tid") is not None:
+                    category_id = f"tag:{int(raw['tid'])}"
+                    title = str(raw.get("tname") or "").strip()
+                elif raw.get("cid") is not None:
+                    category_id = f"cate:{int(raw['cid'])}"
+                    title = str(raw.get("cname") or "").strip()
+                else:
+                    continue
+                if title and category_id not in seen:
+                    seen.add(category_id)
+                    categories.append(CatalogCategory(category_id, title))
+            self._server_categories = tuple(categories)
+            return self.list_categories()
+
+    def reset_session_cache(self) -> None:
+        """登录态变化后丢弃账号相关目录缓存，不持久化任何会话数据。"""
+        with self._category_lock:
+            self._server_categories = None
+        self._items_by_id.clear()
 
     def _common(self) -> dict[str, object]:
         if self._session_provider is None or self._device_provider is None:
@@ -230,59 +259,78 @@ class YuanqiResourceSource:
             price=int(raw.get("price") or 0),
         )
 
-    def _list_server_page(self, category_id: str, page: int, page_size: int = PAGE_SIZE) -> CatalogPage:
-        if page < 1:
-            raise ValueError("页码必须从 1 开始")
-        body: dict[str, object] = {
-            "login_info": {},
-            "common": self._common(),
-            "page": page,
-            "page_size": page_size,
-            "cate_id": int(category_id or "0"),
-            "tag_id": 0,
-            "sort_type": 1,
-        }
-        payload = self._post(CATALOG_URL, body)
+    @staticmethod
+    def _selector(category_id: str) -> tuple[int, int]:
+        try:
+            if category_id.startswith("tag:"):
+                return 0, int(category_id.split(":", 1)[1])
+            if category_id.startswith("cate:"):
+                return int(category_id.split(":", 1)[1]), 0
+            # 兼容旧缓存键和调用方；纯数字在官方协议中表示 cid。
+            return int(category_id or "0"), 0
+        except (TypeError, ValueError) as exc:
+            raise CatalogError("分类标识不是资源服务返回的 cid/tid") from exc
+
+    def _page_from_list_payload(self, payload: Mapping[str, object], page: int) -> CatalogPage:
         data = payload.get("data") or {}
         if not isinstance(data, Mapping):
             raise CatalogError("资源列表结构错误")
         raw_items = data.get("list") or []
         if not isinstance(raw_items, list):
             raise CatalogError("资源列表结构错误")
+        if not raw_items and isinstance(data.get("recommend_list"), list):
+            raw_items = data["recommend_list"]
         items = tuple(self._parse_item(raw) for raw in raw_items if isinstance(raw, Mapping))
         self._items_by_id.update({item.id: item for item in items if item.id})
-        # 部分类别的 total 是全站总数，不能用它判断末页；以实际页大小为准。
-        has_more = len(raw_items) >= PAGE_SIZE
         try:
             total = int(data.get("total") or 0)
         except (TypeError, ValueError):
             total = 0
-        return CatalogPage(items, page, has_more, total)
+        return CatalogPage(items, page, len(raw_items) >= PAGE_SIZE, total)
 
-    def _ensure_full_index(
-        self, progress_cb: Callable[[int, int], None] | None = None
-    ) -> tuple[CatalogItem, ...]:
-        if self._full_index is not None:
-            return self._full_index
-        with self._index_lock:
-            if self._full_index is not None:
-                return self._full_index
-            collected: dict[str, CatalogItem] = {}
-            page = 1
-            while page <= 100:
-                if progress_cb:
-                    progress_cb(len(collected), page)
-                result = self._list_server_page("0", page, FULL_INDEX_PAGE_SIZE)
-                for item in result.items:
-                    collected[item.id] = item
-                if not result.has_more:
-                    break
-                # 全站 total 在此接口可靠，可避免末尾额外请求。
-                if result.total and len(collected) >= result.total:
-                    break
-                page += 1
-            self._full_index = tuple(collected.values())
-            return self._full_index
+    def _list_server_page(
+        self,
+        category_id: str,
+        page: int,
+        page_size: int = PAGE_SIZE,
+        *,
+        sort_type: int = SORT_HOT_DESC,
+        following: bool = False,
+    ) -> CatalogPage:
+        if page < 1:
+            raise ValueError("页码必须从 1 开始")
+        cate_id, tag_id = self._selector(category_id)
+        body: dict[str, object] = {
+            "login_info": {},
+            "common": self._common(),
+            "page": page,
+            "page_size": page_size,
+            "cate_id": cate_id,
+            "tag_id": tag_id,
+            "sort_type": sort_type,
+        }
+        return self._page_from_list_payload(self._post(FOLLOWING_URL if following else CATALOG_URL, body), page)
+
+    def _featured_page(self, page: int, page_size: int = PAGE_SIZE) -> CatalogPage:
+        if page < 1:
+            raise ValueError("页码必须从 1 开始")
+        body = {
+            "login_info": {},
+            "common": self._common(),
+            "count": page_size,
+            "offset": (page - 1) * page_size,
+        }
+        payload = self._post(INDEX_URL, body)
+        raw_items = payload.get("data") or []
+        if not isinstance(raw_items, list):
+            raise CatalogError("精选资源结构错误")
+        items = tuple(self._parse_item(raw) for raw in raw_items if isinstance(raw, Mapping))
+        self._items_by_id.update({item.id: item for item in items if item.id})
+        try:
+            total = int(payload.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return CatalogPage(items, page, len(raw_items) >= page_size, total)
 
     def search(
         self,
@@ -291,39 +339,30 @@ class YuanqiResourceSource:
         page_size: int = PAGE_SIZE,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> CatalogPage:
-        """搜索壁纸：基于后台同步的全站索引做本地过滤，索引缓存后无需重复同步。"""
+        """调用元气静态页使用的全局搜索接口，不继承当前分类。"""
         keyword = keyword.strip()
         if not keyword:
             return CatalogPage((), page, False, 0)
-        index = self._ensure_full_index(progress_cb)
-        terms = tuple(part for part in keyword.casefold().split() if part)
-        filtered = [item for item in index if all(term in item.search_text for term in terms)]
-        start = (page - 1) * page_size
-        items = tuple(filtered[start:start + page_size])
-        return CatalogPage(items, page, start + len(items) < len(filtered), len(filtered))
-
-    @staticmethod
-    def _is_4k(item: CatalogItem) -> bool:
-        text = f"{item.resolution} {' '.join(item.tags)}".casefold()
-        if "4k" in text:
-            return True
-        numbers = [int(part) for part in text.replace("×", "x").split("x") if part.strip().isdigit()]
-        return bool(numbers and max(numbers) >= 3840)
+        if page < 1:
+            raise ValueError("页码必须从 1 开始")
+        body = {
+            "login_info": {},
+            "common": self._common(),
+            "kw": keyword,
+            "page": page,
+            "page_size": page_size,
+        }
+        return self._page_from_list_payload(self._post(SEARCH_URL, body), page)
 
     def list_items(self, category_id: str, page: int = 1, query: str = "") -> CatalogPage:
-        query = query.strip().casefold()
-        if not query and category_id != "__4k__":
-            return self._list_server_page(category_id or "0", page)
-        index = self._ensure_full_index()
-        filtered = [item for item in index if category_id in ("", "0", "__4k__") or item.category_id == category_id]
-        if category_id == "__4k__":
-            filtered = [item for item in filtered if self._is_4k(item)]
+        query = query.strip()
         if query:
-            terms = tuple(part for part in query.split() if part)
-            filtered = [item for item in filtered if all(term in item.search_text for term in terms)]
-        start = (page - 1) * PAGE_SIZE
-        items = tuple(filtered[start:start + PAGE_SIZE])
-        return CatalogPage(items, page, start + len(items) < len(filtered), len(filtered))
+            return self.search(query, page)
+        if category_id == "__following__":
+            return self._list_server_page("-1", page, sort_type=SORT_TIME_DESC, following=True)
+        if category_id in {"", "0", "__featured__"}:
+            return self._featured_page(page)
+        return self._list_server_page(category_id, page, sort_type=SORT_HOT_DESC)
 
     def suggestions(self, query: str) -> tuple[str, ...]:
         query = query.strip()
