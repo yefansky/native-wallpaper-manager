@@ -539,14 +539,69 @@ class CoreTests(unittest.TestCase):
             with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
                 window = app.App(root)
             theme = CatalogItem(
-                "theme-1", "随真实时间变化", "https://example.test/theme.jpg",
+                "theme-1", "普通主题", "https://example.test/theme.jpg",
                 resource_kind="theme", format="scene",
+                source_video_url="https://img-baofun.zhhainiao.com/theme.mp4",
             )
             with patch.object(app.messagebox, "askokcancel", return_value=False) as confirm:
                 self.assertFalse(window._confirm_scene_conversion(theme))
             self.assertEqual(confirm.call_args.kwargs["default"], "cancel")
             self.assertIn("Windows 原生 .theme", confirm.call_args.args[1])
             self.assertIn("已取消转换", window.status.get())
+        finally:
+            root.destroy()
+
+    def test_theme_with_live_components_and_private_package_is_blocked(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            theme = CatalogItem(
+                "theme-time", "随真实时间变化", "https://example.test/theme.jpg",
+                resource_kind="theme", format="scene",
+                source_video_url="https://img-baofun.zhhainiao.com/theme.zip",
+                preview_video_url="https://img-baofun.zhhainiao.com/theme_preview.mp4",
+            )
+            with patch.object(app.messagebox, "showwarning") as warning, patch.object(
+                app.messagebox, "askokcancel"
+            ) as confirm:
+                self.assertFalse(window._confirm_scene_conversion(theme))
+            warning.assert_called_once()
+            confirm.assert_not_called()
+            self.assertIn("固定假时钟", warning.call_args.args[1])
+            self.assertIn("已阻止转换", window.status.get())
+        finally:
+            root.destroy()
+
+    def test_theme_detail_keeps_both_actions_inside_dialog(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            theme = CatalogItem(
+                "theme-detail", "详情布局", "https://example.test/theme.jpg",
+                resource_kind="theme", format="scene",
+            )
+            with patch.object(window, "_load_detail_image"):
+                dialog = window.show_online_detail(theme)
+            self.assertIsNotNone(dialog)
+            dialog.update_idletasks()
+
+            def descendants(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from descendants(child)
+
+            actions = [
+                widget for widget in descendants(dialog)
+                if isinstance(widget, app.tk.Button) and "原生主题" in widget.cget("text")
+            ]
+            self.assertEqual(len(actions), 2)
+            dialog_bottom = dialog.winfo_rooty() + dialog.winfo_height()
+            self.assertTrue(all(button.winfo_rooty() + button.winfo_height() <= dialog_bottom for button in actions))
+            dialog.destroy()
         finally:
             root.destroy()
 
@@ -896,14 +951,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(page.items[0].tags, ("主题",))
         self.assertEqual(page.items[0].components, ("mouse_tail", "theme"))
         self.assertTrue(app.theme_has_live_component_risk(page.items[0]))
-        self.assertEqual(source.download_original("58297"), b"theme-jpeg")
-        self.assertEqual(
-            converter.call_args_list,
-            [
-                unittest.mock.call(raw["preview_video"], http=source._http, decrypt=False),
-            ],
+        with self.assertRaisesRegex(CatalogError, "禁止自动回退"):
+            source.download_original("58297")
+        converter.assert_not_called()
+        self.assertEqual(source.conversion_summary("58297"), "")
+
+    def test_theme_with_direct_video_uses_dynamic_clean_source_path(self):
+        converted = ConvertedFrame(b"clean-theme-jpeg", 3840, 2160, 4.0, 80.0, 5)
+        converter = unittest.mock.Mock(return_value=converted)
+        source = YuanqiThemeResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
         )
-        self.assertTrue(source.conversion_summary("58297").startswith("预览回退 · "))
+        item = CatalogItem(
+            "theme-clean", "带时钟主题", "https://img-baofun.zhhainiao.com/theme.jpg",
+            resource_kind="theme", format="scene",
+            source_video_url="https://img-baofun.zhhainiao.com/theme.mp4",
+            preview_video_url="https://img-baofun.zhhainiao.com/theme_preview.mp4",
+        )
+        source._items_by_id[item.id] = item
+
+        self.assertEqual(source.download_original(item.id), b"clean-theme-jpeg")
+        converter.assert_called_once_with(item.source_video_url, http=source._http, decrypt=True)
+        self.assertTrue(source.conversion_summary(item.id).startswith("高清源 · "))
 
     def test_theme_featured_combines_carousel_and_cursor_pages(self):
         source = YuanqiThemeResourceSource(

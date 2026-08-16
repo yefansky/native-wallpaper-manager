@@ -34,6 +34,7 @@ from catalog import (
     YuanqiDynamicResourceSource,
     YuanqiResourceSource,
     YuanqiThemeResourceSource,
+    theme_preview_has_live_component_risk,
 )
 from product import SingleInstance, autostart_enabled, set_autostart
 from yuanqi_auth import (
@@ -78,9 +79,9 @@ SCENE_COMPONENT_WARNING = (
 THEME_CONVERSION_WARNING = (
     "元气电脑主题可能包含动态壁纸、时钟/天气/系统信息、鼠标特效、任务栏和窗口皮肤。"
     "这些组件依赖元气私有播放器或美化引擎，Windows 原生 .theme 不能承载。\n\n"
-    "桌面画廊会优先尝试可验证的正式画面；若 CWP3/资源包不能由标准解码器验证，则回退标准 preview_video。"
-    "两种路径都会多点选择高清帧，并生成只包含该静态壁纸的 Windows 原生 .theme 文件。"
-    "回退预览中已经合成的文字或组件会保留为不会更新的固定画面。\n\n"
+    "桌面画廊会优先尝试可验证的正式画面；普通主题无法验证时可回退标准 preview_video，"
+    "但已识别出时间、天气等实时组件的主题会禁止该回退，避免生成固定假时钟。"
+    "可转换画面会多点择优，并生成只包含该静态壁纸的 Windows 原生 .theme 文件。\n\n"
     "是否接受这种原生静态降级并继续？"
 )
 DEFAULT_YUANQI_CACHE_DIRS = (
@@ -135,12 +136,13 @@ def scene_components_may_be_baked(item: CatalogItem) -> bool:
 
 
 def theme_has_live_component_risk(item: CatalogItem) -> bool:
-    if item.resource_kind != "theme":
-        return False
-    text = item.search_text
-    has_named_risk = any(keyword in text for keyword in ("时钟", "时间", "实时", "天气", "系统信息", "组件"))
-    has_private_component = any(component.casefold() not in {"", "theme"} for component in item.components)
-    return has_named_risk or has_private_component
+    return theme_preview_has_live_component_risk(item)
+
+
+def has_direct_clean_video_source(item: CatalogItem) -> bool:
+    """只有直接视频源可按动态壁纸路径还原；ZIP/CWP 不冒充干净视频。"""
+    path = urllib.parse.urlparse(item.source_video_url).path.casefold()
+    return path.endswith(".mp4")
 
 
 def load_config() -> dict:
@@ -1280,7 +1282,11 @@ class App:
         if item.resource_kind == "theme":
             meta_text = "电脑主题转原生 · 仅保留壁纸"
             if theme_has_live_component_risk(item):
-                meta_text += " · 动态组件会固化"
+                meta_text += (
+                    " · 无干净源时禁止转换"
+                    if not has_direct_clean_video_source(item)
+                    else " · 使用干净视频"
+                )
         elif scene_components_may_be_baked(item):
             meta_text = "场景转静态 · 组件可能固化"
         else:
@@ -1410,19 +1416,27 @@ class App:
                 self.online_download_button.configure(text="转换到本地" if dynamic else "下载到本地")
                 self.online_apply_button.configure(text="转换并设为壁纸" if dynamic else "下载并设为壁纸")
         if item.resource_kind == "theme":
-            suffix = "；优先正式画面、失败回退预览，只保留壁纸并生成 Windows 原生 .theme。"
+            if theme_has_live_component_risk(item) and not has_direct_clean_video_source(item):
+                suffix = "；当前只有私有资源包和带组件预览，为避免固定假时钟，不允许转换应用。"
+            else:
+                suffix = "；优先正式画面，安全降级时只保留壁纸并生成 Windows 原生 .theme。"
         else:
             suffix = "；将从预览视频多点选取高清帧。" if item.resource_kind == "dynamic" else "；双击卡片可查看大图。"
         self.status.set(f"已选择：{item.title}{suffix}")
 
-    def show_online_detail(self, item: CatalogItem | None = None) -> None:
+    def show_online_detail(self, item: CatalogItem | None = None) -> tk.Toplevel | None:
         item = item or self.selected_online()
         if not item:
             messagebox.showinfo("请选择壁纸", "请先在联网壁纸里点选一张。")
             return
         dialog = tk.Toplevel(self.root)
         dialog.title(f"壁纸详情 · {item.title}")
-        dialog.geometry("920x640")
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        dialog_width = max(700, min(960, screen_width - 80))
+        dialog_height = max(500, min(760, screen_height - 80))
+        dialog.geometry(f"{dialog_width}x{dialog_height}")
+        dialog.minsize(min(700, dialog_width), min(500, dialog_height))
         dialog.configure(bg=PANEL)
         top = tk.Frame(dialog, bg=PANEL); top.pack(fill="x", padx=16, pady=(14, 6))
         tk.Label(top, text=item.title, bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(side="left")
@@ -1432,29 +1446,40 @@ class App:
             tk.Label(
                 dialog,
                 text=(
-                    "电脑主题优先尝试可验证的正式画面，失败时从 preview_video 回退；"
-                    "两者均从 5 个时间点择优生成静态壁纸和 Windows 原生 .theme，私有组件不接入。"
+                    (
+                        "电脑主题优先尝试可验证的正式视频并从 5 个时间点择优；"
+                        "当前主题只有 CWP3/资源包和带实时组件预览，因此不会用 preview_video 生成固定假时钟。"
+                        if theme_has_live_component_risk(item) and not has_direct_clean_video_source(item)
+                        else "电脑主题优先尝试可验证的正式画面；安全降级画面从 5 个时间点择优生成静态壁纸和 Windows 原生 .theme，私有组件不接入。"
+                    )
                     if item.resource_kind == "theme"
                     else "画面预览仅用于浏览；转换优先可验证高清源、失败回退 preview_video，并从 5 个时间点解码全分辨率帧择优，不取首帧。"
                 ),
                 bg=PANEL,
                 fg=PINK,
                 anchor="w",
+                justify="left",
+                wraplength=dialog_width - 48,
                 font=("Microsoft YaHei UI", 9, "bold"),
             ).pack(fill="x", padx=16, pady=(0, 3))
         if scene_components_may_be_baked(item):
+            warning_text = "注意：scene 预览可能已合成时间/天气组件；转成 Windows 原生 JPEG 后不会更新，转换前请检查画面。"
+            if item.resource_kind == "theme" and theme_has_live_component_risk(item) and not has_direct_clean_video_source(item):
+                warning_text = "该主题只有 CWP3/资源包和带组件预览；为避免生成固定假时钟，已禁止使用 preview_video 转换或应用。"
             tk.Label(
                 dialog,
-                text="注意：scene 预览可能已合成时间/天气组件；转成 Windows 原生 JPEG 后不会更新，转换前请检查画面。",
+                text=warning_text,
                 bg="#fff1d6",
                 fg="#8a4b00",
                 anchor="w",
+                justify="left",
+                wraplength=dialog_width - 64,
                 font=("Microsoft YaHei UI", 9, "bold"),
                 padx=8,
                 pady=5,
             ).pack(fill="x", padx=16, pady=(0, 3))
-        image_label = tk.Label(dialog, bg="#d8dce6"); image_label.pack(fill="both", expand=True, padx=16, pady=6)
-        actions = tk.Frame(dialog, bg=PANEL); actions.pack(fill="x", padx=16, pady=(6, 14))
+        # 操作区先固定在底部，图片只能使用剩余空间，避免小屏/RDP 分辨率下按钮被裁掉。
+        actions = tk.Frame(dialog, bg=PANEL); actions.pack(side="bottom", fill="x", padx=16, pady=(6, 14))
         if item.resource_kind == "theme":
             download_label, apply_label = "转换为 Windows 原生主题", "转换并应用原生主题"
         else:
@@ -1462,16 +1487,19 @@ class App:
             apply_label = "转换并应用为壁纸" if item.resource_kind == "dynamic" else "下载并应用为壁纸"
         self.button(actions, download_label, lambda: self._download_item_to_library(item)).pack(side="left", padx=(0, 8))
         self.button(actions, apply_label, lambda: self._apply_item(item)).pack(side="left", padx=(0, 8))
+        image_label = tk.Label(dialog, bg="#d8dce6"); image_label.pack(fill="both", expand=True, padx=16, pady=6)
         self.status.set(f"正在加载大图：{item.title}")
-        threading.Thread(target=self._load_detail_image, args=(item, image_label), daemon=True).start()
+        image_size = (max(480, dialog_width - 60), max(260, dialog_height - 210))
+        threading.Thread(target=self._load_detail_image, args=(item, image_label, image_size), daemon=True).start()
+        return dialog
 
-    def _load_detail_image(self, item: CatalogItem, label: tk.Label) -> None:
+    def _load_detail_image(self, item: CatalogItem, label: tk.Label, size: tuple[int, int] = (860, 480)) -> None:
         try:
             response = requests.get(item.large_preview_url or item.original_url or item.preview_url, timeout=30)
             image = Image.open(io.BytesIO(response.content)).convert("RGB")
         except (OSError, ValueError, requests.RequestException):
             image = Image.new("RGB", (820, 460), "#d8dce6")
-        image.thumbnail((860, 480), Image.Resampling.LANCZOS)
+        image.thumbnail(size, Image.Resampling.LANCZOS)
         self._safe_after(lambda current=image: self._apply_detail_image(label, current))
 
     @staticmethod
@@ -1501,6 +1529,15 @@ class App:
 
     def _confirm_scene_conversion(self, item: CatalogItem) -> bool:
         if item.resource_kind == "theme":
+            if theme_has_live_component_risk(item) and not has_direct_clean_video_source(item):
+                messagebox.showwarning(
+                    "该主题无法安全转为静态壁纸",
+                    "该主题的正式画面是 CWP3/资源包，当前无法按标准视频验证；preview_video 已合成时间或天气组件。\n\n"
+                    "为避免生成不会更新的固定假时钟，桌面画廊不会自动回退预览视频。",
+                    parent=self.root,
+                )
+                self.status.set("已阻止转换：该主题没有可验证的干净视频源，预览中的时间组件会固化。")
+                return False
             accepted = messagebox.askokcancel(
                 "电脑主题将降级为原生静态主题",
                 THEME_CONVERSION_WARNING,
@@ -1513,7 +1550,7 @@ class App:
             return accepted
         if not scene_components_may_be_baked(item):
             return True
-        if item.source_video_url:
+        if has_direct_clean_video_source(item):
             # 用解密后的干净高清源视频，时间/天气 HUD 不会被烘焙进静态画面。
             accepted = messagebox.askokcancel(
                 "使用干净源视频转换",

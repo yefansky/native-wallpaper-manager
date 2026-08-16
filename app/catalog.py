@@ -188,6 +188,16 @@ def validate_resource_source_video_url(url: str) -> str:
     return url
 
 
+def theme_preview_has_live_component_risk(item: CatalogItem) -> bool:
+    """主题预览中可能已合成无法更新的时钟、天气或私有组件。"""
+    if item.resource_kind != "theme":
+        return False
+    text = item.search_text
+    has_named_risk = any(keyword in text for keyword in ("时钟", "时间", "实时", "天气", "系统信息", "组件"))
+    has_private_component = any(component.casefold() not in {"", "theme"} for component in item.components)
+    return has_named_risk or has_private_component
+
+
 class YuanqiResourceSource:
     """使用自研扫码会话访问元气 PC 静态壁纸资源。"""
 
@@ -660,6 +670,9 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
     def _source_conversion_allowed(self, item: CatalogItem) -> bool:
         return bool(item.source_video_url)
 
+    def _preview_fallback_allowed(self, item: CatalogItem) -> bool:
+        return True
+
     def download_original(self, item_id: str) -> bytes:
         item = self._items_by_id.get(str(item_id))
         if item is None:
@@ -680,7 +693,7 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
                 # 正式资源可能是真 CWP3/主题包，不能验证时安全回退标准预览视频。
                 source_error = exc
 
-        if converted is None and item.preview_video_url:
+        if converted is None and item.preview_video_url and self._preview_fallback_allowed(item):
             try:
                 preview_url = validate_resource_preview_video_url(item.preview_video_url)
                 converted = self._converter(preview_url, http=self._http, decrypt=False)
@@ -689,6 +702,12 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
                 if source_error is not None:
                     raise CatalogError(f"正式资源无法解析，预览回退也失败：{exc}") from exc
                 raise CatalogError(str(exc)) from exc
+
+        if converted is None and item.preview_video_url and not self._preview_fallback_allowed(item):
+            raise CatalogError(
+                "该电脑主题的正式画面是暂不支持的 CWP3/资源包；为避免把时间、天气等组件"
+                "烘焙成不会更新的固定画面，已禁止自动回退 preview_video。"
+            ) from source_error
 
         if converted is None:
             assert source_error is not None
@@ -746,6 +765,10 @@ class YuanqiThemeResourceSource(YuanqiDynamicResourceSource):
         # 现有转换器只处理能还原成标准视频的流；提前跳过可避免每次白下载几十 MiB。
         path = urlparse(item.source_video_url).path.casefold()
         return bool(path) and not path.endswith((".zip", ".cwp"))
+
+    def _preview_fallback_allowed(self, item: CatalogItem) -> bool:
+        # 普通主题仍可降级；明确带实时组件的主题绝不能静默烘焙预览 HUD。
+        return not theme_preview_has_live_component_risk(item)
 
     def refresh_categories(self) -> tuple[CatalogCategory, ...]:
         if self._server_categories is not None:
