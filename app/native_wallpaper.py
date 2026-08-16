@@ -22,9 +22,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from PIL import Image, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageOps, ImageTk
+import pystray
 
 from catalog import CatalogError, CatalogItem, IntegrationUnavailable, YuanqiResourceSource
+from product import SingleInstance, autostart_enabled, set_autostart
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -287,6 +289,8 @@ class App:
         self._build()
         self.refresh()
         self.schedule_next()
+        self._init_tray()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def button(self, parent, text, command, *, accent=False, width=None):
         return tk.Button(parent, text=text, command=command, width=width, relief="flat", cursor="hand2",
@@ -488,6 +492,45 @@ class App:
     def _safe_after(self, callback) -> None:
         """从后台线程把 UI 更新投递到主线程队列；线程安全。"""
         self._ui_queue.put(callback)
+
+    def _make_tray_image(self) -> Image.Image:
+        image = Image.new("RGBA", (64, 64), "#f4b734")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([5, 5, 59, 59], outline="#8a6d1a", width=3)
+        draw.rectangle([12, 20, 52, 52], outline="#5a4a12", width=2)
+        draw.polygon([(16, 46), (30, 30), (38, 38), (46, 26), (48, 46)], fill="#ffffff")
+        draw.ellipse([34, 24, 42, 32], fill="#5a4a12")
+        return image
+
+    def _init_tray(self) -> None:
+        menu = pystray.Menu(
+            pystray.MenuItem("显示桌面画廊", self._tray_show, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("退出", self._tray_quit),
+        )
+        self.tray_icon = pystray.Icon("desktop_gallery", self._make_tray_image(), "桌面画廊 · 原生壁纸管理器", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _on_close(self) -> None:
+        """点窗口关闭按钮时隐藏到系统托盘，不退出程序。"""
+        self.root.withdraw()
+        try:
+            self.tray_icon.notify("桌面画廊仍在运行，双击托盘图标可重新打开。", "桌面画廊")
+        except Exception:
+            pass
+
+    def _tray_show(self, *_args) -> None:
+        self._safe_after(lambda: (self.root.deiconify(), self.root.lift(), self.root.focus_force()))
+
+    def _tray_quit(self, *_args) -> None:
+        self._safe_after(self._quit_app)
+
+    def _quit_app(self) -> None:
+        try:
+            self.tray_icon.stop()
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _poll_ui_queue(self) -> None:
         """主线程每 80ms 排空 UI 更新队列，再重新调度自身。"""
@@ -931,10 +974,33 @@ class App:
         return page
 
     def build_mine_page(self) -> tk.Frame:
-        page = tk.Frame(self.root, bg=BG); self.page_header(page, "我的", "本地资料库、收藏和 Windows 主题文件。")
+        page = tk.Frame(self.root, bg=BG); self.page_header(page, "我的", "本地资料库、收藏、系统设置。")
         self.mine_summary = tk.Label(page, text="", bg=PANEL, fg=TEXT, justify="left", anchor="nw", padx=24, pady=24, font=("Microsoft YaHei UI", 12))
         self.mine_summary.pack(fill="x")
+
+        system = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=22, pady=16)
+        system.pack(fill="x", pady=(0, 12))
+        tk.Label(system, text="系统", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        tk.Label(system, text="关闭窗口时最小化到系统托盘；右键托盘图标可恢复或退出。", bg=PANEL, fg=MUTED,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(4, 8))
+        row = tk.Frame(system, bg=PANEL); row.pack(anchor="w")
+        self.autostart_button = self.button(row, "", self.toggle_autostart, accent=True)
+        self.autostart_button.pack(side="left")
+        tk.Label(row, text="随系统启动", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 10)).pack(side="left", padx=8)
+        self.refresh_autostart_button()
         return page
+
+    def refresh_autostart_button(self) -> None:
+        enabled = autostart_enabled()
+        self.autostart_button.configure(text="关闭开机自启" if enabled else "开启开机自启")
+
+    def toggle_autostart(self) -> None:
+        enabled = autostart_enabled()
+        ok = set_autostart(not enabled)
+        self.refresh_autostart_button()
+        self.status.set("开机自启已开启。" if ok and not enabled else ("开机自启已关闭。" if ok else "设置开机自启失败。"))
+        if not ok:
+            messagebox.showerror("开机自启", "无法写入 HKCU 启动项，请检查权限。")
 
     def visible_items(self) -> list[Wallpaper]:
         return [item for item in self.items if item.favorite or not self.filter_favorites]
@@ -1211,4 +1277,12 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk(); App(root); root.mainloop()
+    instance = SingleInstance()
+    if instance.already_running:
+        from product import notify_already_running
+        notify_already_running()
+        raise SystemExit(0)
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+    instance.release()

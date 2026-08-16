@@ -9,6 +9,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
 import session_store as session_store
+from product import SingleInstance, autostart_command, autostart_enabled, set_autostart
 from catalog import CatalogError, IntegrationUnavailable, YuanqiOfficialApiSource, YuanqiResourceSource
 from yuanqi_auth import (
     AuthPhase,
@@ -338,6 +339,33 @@ class CoreTests(unittest.TestCase):
                 self.assertIsNone(session_store.load_session())
             finally:
                 session_store.SESSION_PATH = original
+
+    def test_autostart_command_uses_pythonw_and_script(self):
+        command = autostart_command()
+        self.assertIn("pythonw.exe", command)
+        self.assertIn("native_wallpaper.py", command)
+        self.assertTrue(command.startswith('"') and command.endswith('"'))
+
+    def test_single_instance_mutex(self):
+        # 用独立命名的互斥体，避免与正在运行的应用实例冲突。
+        first = SingleInstance("Local\\TestNativeWallpaperMutex")
+        second = SingleInstance("Local\\TestNativeWallpaperMutex")
+        try:
+            self.assertFalse(first.already_running)
+            self.assertTrue(second.already_running)
+        finally:
+            first.release()
+            second.release()
+
+    def test_autostart_registry_toggle(self):
+        # 用真实的 HKCU Run 键测试开启/关闭，最终确保关闭。
+        try:
+            ok_on = set_autostart(True)
+            self.assertTrue(ok_on)
+            self.assertTrue(autostart_enabled())
+        finally:
+            set_autostart(False)
+        self.assertFalse(autostart_enabled())
 
     def test_config_round_trip(self):
         original = app.CONFIG_PATH
