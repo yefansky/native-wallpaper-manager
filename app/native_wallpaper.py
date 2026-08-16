@@ -351,6 +351,8 @@ class App:
         self._featured_main_container: tk.Frame | None = None
         self._featured_main_label: tk.Label | None = None
         self._featured_title_label: tk.Label | None = None
+        self._featured_dynamic_footer: tk.Frame | None = None
+        self._featured_hot_label: tk.Label | None = None
         self._featured_indicator_buttons: list[tk.Button] = []
         self._featured_theme_labels: list[tk.Label] = []
         self._loading_online = False
@@ -1002,6 +1004,8 @@ class App:
         self._featured_main_container = None
         self._featured_main_label = None
         self._featured_title_label = None
+        self._featured_dynamic_footer = None
+        self._featured_hot_label = None
         self._featured_indicator_buttons = []
         self._featured_theme_labels = []
 
@@ -1030,17 +1034,26 @@ class App:
         picture._photo = photo
         self._featured_main_label = picture
         title = tk.Label(
-            picture, text="", bg="#20232a", fg="#ffffff", anchor="w",
+            container, text="", bg="#20232a", fg="#ffffff", anchor="w",
             font=("Microsoft YaHei UI", 11, "bold"), padx=10, pady=5,
         )
         title.place(x=12, y=12)
         self._featured_title_label = title
-        tk.Label(
-            picture, text="今日热榜", bg="#20232a", fg="#ffffff",
-            font=("Microsoft YaHei UI", 14, "bold"), padx=10, pady=4,
-        ).place(x=14, rely=1.0, y=-46)
-        indicators = tk.Frame(picture, bg="#20232a")
-        indicators.place(x=132, rely=1.0, y=-45)
+
+        # 元气式固定底栏：标题、1–5 和动作均是独立容器，不挂在图片 Label 上，
+        # 避免 DPI/窗口缩放或图片异步替换时子控件被裁掉。
+        footer = tk.Frame(container, bg="#0b0c0f", height=46)
+        footer.place(x=0, rely=1.0, anchor="sw", relwidth=1.0, height=46)
+        footer.pack_propagate(False)
+        self._featured_dynamic_footer = footer
+        hot_label = tk.Label(
+            footer, text="今日热榜", bg="#0b0c0f", fg="#ffffff",
+            font=("Microsoft YaHei UI", 14, "bold"), padx=12,
+        )
+        hot_label.pack(side="left", fill="y")
+        self._featured_hot_label = hot_label
+        indicators = tk.Frame(footer, bg="#0b0c0f")
+        indicators.pack(side="left", fill="y", padx=(2, 0))
         for index in range(len(self.online_featured_items)):
             button = tk.Button(
                 indicators, text=str(index + 1), width=2,
@@ -1049,15 +1062,26 @@ class App:
                 activebackground=PINK, activeforeground="#ffffff",
                 font=("Microsoft YaHei UI", 9, "bold"), padx=1, pady=1,
             )
-            button.pack(side="left", padx=2)
+            button.pack(side="left", padx=2, pady=10)
             self._featured_indicator_buttons.append(button)
+
+        footer_actions = tk.Frame(footer, bg="#0b0c0f")
+        footer_actions.pack(side="right", fill="y", padx=7)
+        self.button(
+            footer_actions, "转换到本地", self._download_featured_current,
+            accent=True, compact=True,
+        ).pack(side="left", padx=4, pady=6)
+        self.button(
+            footer_actions, "转换并设为壁纸", self._apply_featured_current,
+            accent=True, compact=True,
+        ).pack(side="left", padx=4, pady=6)
         tk.Button(
-            picture, text="‹", command=lambda: self._change_featured_carousel(-1),
+            container, text="‹", command=lambda: self._change_featured_carousel(-1),
             relief="flat", bd=0, cursor="hand2", bg="#20232a", fg="#ffffff",
             activebackground=PINK, activeforeground="#ffffff", font=("Microsoft YaHei UI", 25, "bold"),
         ).place(x=0, rely=0.5, anchor="w", width=44, height=74)
         tk.Button(
-            picture, text="›", command=lambda: self._change_featured_carousel(1),
+            container, text="›", command=lambda: self._change_featured_carousel(1),
             relief="flat", bd=0, cursor="hand2", bg="#20232a", fg="#ffffff",
             activebackground=PINK, activeforeground="#ffffff", font=("Microsoft YaHei UI", 25, "bold"),
         ).place(relx=1.0, x=-44, rely=0.5, anchor="w", width=44, height=74)
@@ -1127,6 +1151,18 @@ class App:
         if item is not None:
             self.show_online_detail(item)
 
+    def _download_featured_current(self) -> None:
+        item = self._featured_current_item()
+        if item is not None:
+            self.select_online(item)
+            self._download_item_to_library(item)
+
+    def _apply_featured_current(self) -> None:
+        item = self._featured_current_item()
+        if item is not None:
+            self.select_online(item)
+            self._apply_item(item)
+
     def _change_featured_carousel(self, delta: int) -> None:
         self._set_featured_carousel_index(self._featured_carousel_index + delta, select=True)
 
@@ -1143,6 +1179,9 @@ class App:
             self._set_featured_label_image(self._featured_main_label, current, (960, 400))
         if self._featured_title_label is not None:
             self._featured_title_label.configure(text=current.title)
+            self._featured_title_label.lift()
+        if self._featured_dynamic_footer is not None:
+            self._featured_dynamic_footer.lift()
         for position, button in enumerate(self._featured_indicator_buttons):
             active = position == self._featured_carousel_index
             button.configure(bg=PINK if active else "#111318")
@@ -1212,6 +1251,11 @@ class App:
             photo = ImageTk.PhotoImage(image)
             label._photo = photo
             label.configure(image=photo)
+            if label is self._featured_main_label:
+                if self._featured_title_label is not None:
+                    self._featured_title_label.lift()
+                if self._featured_dynamic_footer is not None:
+                    self._featured_dynamic_footer.lift()
         except tk.TclError:
             return
 

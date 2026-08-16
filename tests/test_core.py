@@ -456,6 +456,28 @@ class CoreTests(unittest.TestCase):
                 root.update_idletasks()
             self.assertEqual(window._featured_carousel_kind, "dynamic")
             self.assertEqual(len(window._featured_indicator_buttons), 5)
+            self.assertEqual([button.cget("text") for button in window._featured_indicator_buttons], list("12345"))
+            self.assertEqual(window._featured_hot_label.cget("text"), "今日热榜")
+            self.assertEqual(window._featured_dynamic_footer.winfo_manager(), "place")
+            self.assertTrue(all(
+                button.master.master is window._featured_dynamic_footer
+                for button in window._featured_indicator_buttons
+            ))
+            self.assertEqual(
+                (window._featured_main_label._photo.width(), window._featured_main_label._photo.height()),
+                (960, 400),
+            )
+
+            def descendants(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from descendants(child)
+
+            action_labels = {
+                widget.cget("text") for widget in descendants(window._featured_dynamic_footer)
+                if isinstance(widget, app.tk.Button)
+            }
+            self.assertTrue({"转换到本地", "转换并设为壁纸"}.issubset(action_labels))
             self.assertEqual([item.id for item in window.online_grid_items], ["6"])
             self.assertIsNotNone(window._featured_carousel_after_id)
             root.after_cancel(window._featured_carousel_after_id)
@@ -467,6 +489,7 @@ class CoreTests(unittest.TestCase):
             window._set_featured_carousel_index(3, select=True)
             self.assertEqual(window._featured_carousel_index, 3)
             self.assertEqual(window.online_selected_id, "dynamic:4")
+            self.assertEqual(window._featured_title_label.cget("text"), "今日热榜4")
             window._clear_online_grid()
             self.assertIsNone(window._featured_carousel_after_id)
         finally:
