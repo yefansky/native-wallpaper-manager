@@ -33,6 +33,7 @@ from catalog import (
     IntegrationUnavailable,
     YuanqiDynamicResourceSource,
     YuanqiResourceSource,
+    YuanqiThemeResourceSource,
 )
 from product import SingleInstance, autostart_enabled, set_autostart
 from yuanqi_auth import (
@@ -72,6 +73,13 @@ SCENE_COMPONENT_WARNING = (
     "转换成 JPEG 后，这些内容会变成不会更新的固定文字。\n\n"
     "Windows 原生壁纸不能承载元气场景组件，桌面画廊也无法从已合成画面可靠还原被遮挡的背景。\n\n"
     "继续转换会原样保留画面中的组件。是否仍然继续？"
+)
+THEME_CONVERSION_WARNING = (
+    "元气电脑主题可能包含动态壁纸、时钟/天气/系统信息、鼠标特效、任务栏和窗口皮肤。"
+    "这些组件依赖元气私有播放器或美化引擎，Windows 原生 .theme 不能承载。\n\n"
+    "桌面画廊只会从标准 preview_video 多点选择高清帧，并生成只包含该静态壁纸的 Windows 原生 .theme 文件。"
+    "预览中已经合成的文字或组件会保留为不会更新的固定画面。\n\n"
+    "是否接受这种原生静态降级并继续？"
 )
 DEFAULT_YUANQI_CACHE_DIRS = (
     Path.home() / "AppData" / "Roaming" / "kdesk" / "data" / "wallpaper" / "img",
@@ -120,7 +128,14 @@ def wallpaper_matches_query(item: Wallpaper, query: str) -> bool:
 
 
 def scene_components_may_be_baked(item: CatalogItem) -> bool:
-    return item.resource_kind == "dynamic" and item.format.strip().casefold() == "scene"
+    return item.resource_kind in {"dynamic", "theme"} and item.format.strip().casefold() == "scene"
+
+
+def theme_has_live_component_risk(item: CatalogItem) -> bool:
+    if item.resource_kind != "theme":
+        return False
+    text = item.search_text
+    return any(keyword in text for keyword in ("时钟", "时间", "实时", "天气", "系统信息", "组件"))
 
 
 def load_config() -> dict:
@@ -296,7 +311,12 @@ class App:
             session_provider=self._wechat_session_provider,
             device_provider=self._wechat_device_provider,
         )
+        self.yuanqi_theme_source = YuanqiThemeResourceSource(
+            session_provider=self._wechat_session_provider,
+            device_provider=self._wechat_device_provider,
+        )
         self.online_resource_mode = "static"
+        self._last_wallpaper_resource_mode = "static"
         self.online_photo_refs: list[ImageTk.PhotoImage] = []
         self.online_items: list[CatalogItem] = []
         self.online_selected_id: str | None = None
@@ -390,8 +410,8 @@ class App:
         self.gallery.bind("<Configure>", lambda _event: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all")))
         self.gallery_canvas.bind("<Configure>", lambda event: self.gallery_canvas.itemconfigure(self.gallery_window, width=event.width))
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.theme_page = self.build_theme_page()
         self.official_page = self.build_official_page()
+        self.theme_page = self.official_page
         self.beauty_page = self.build_beauty_page()
         self.components_page = self.build_components_page()
         self.mine_page = self.build_mine_page()
@@ -421,7 +441,7 @@ class App:
 
     def show_page(self, name: str) -> None:
         self._current_page = name
-        for page in self.pages.values(): page.pack_forget()
+        for page in dict.fromkeys(self.pages.values()): page.pack_forget()
         self.pages[name].pack(fill="both", expand=True, padx=18, pady=(4, 8))
         for key, button in self.nav_buttons.items():
             button.configure(bg=GOLD if key == name else NAV_BG)
@@ -429,18 +449,27 @@ class App:
         self.online_action_group.pack_forget()
         if name == "wallpaper":
             self.local_action_group.pack(side="right", padx=14, pady=8)
-        elif name == "official":
+        elif name in {"official", "theme"}:
             self.online_action_group.pack(side="right", padx=14, pady=8)
-        if name == "theme": self.refresh_theme_preview()
         if name == "mine": self.refresh_mine_summary()
-        if name == "official":
+        if name == "theme":
+            self.online_mode_row.pack_forget()
+            if self.online_resource_mode != "theme":
+                self._activate_resource_mode("theme")
+            else:
+                self.load_online_items(self.online_cate_id, self.online_page, self.online_query)
+        elif name == "official":
+            self.online_mode_row.pack(fill="x", pady=(2, 4), before=self.online_category_row)
+            if self.online_resource_mode == "theme":
+                self._activate_resource_mode(self._last_wallpaper_resource_mode)
+            else:
+                self.load_online_items(self.online_cate_id, self.online_page, self.online_query)
             self.login_status.configure(text=self._login_status_text())
-            self.load_online_items(self.online_cate_id, self.online_page, self.online_query)
 
     def _on_mousewheel(self, event) -> None:
         """按当前活动页面把滚轮路由到对应 canvas，避免本地/联网图库滚轮错位。"""
         delta = int(-event.delta / 120)
-        canvas = getattr(self, "online_canvas", None) if self._current_page == "official" else getattr(self, "gallery_canvas", None)
+        canvas = getattr(self, "online_canvas", None) if self._current_page in {"official", "theme"} else getattr(self, "gallery_canvas", None)
         if canvas is not None:
             canvas.yview_scroll(delta, "units")
 
@@ -452,6 +481,8 @@ class App:
             self.global_search_entry.focus_set()
             self.status.set("请输入壁纸名称、分类、作者或来源关键词。")
             return
+        if self.online_resource_mode == "theme":
+            self._activate_resource_mode(self._last_wallpaper_resource_mode, reset=False, load=False)
         self.local_query = query
         self.filter_favorites = False
         self.local_page = 0
@@ -535,6 +566,7 @@ class App:
     def build_official_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG)
         mode_row = tk.Frame(page, bg=BG); mode_row.pack(fill="x", pady=(2, 4))
+        self.online_mode_row = mode_row
         self.online_mode_buttons: dict[str, tk.Button] = {}
         for mode, label in (("static", "静态壁纸"), ("dynamic", "动态转静态")):
             button = tk.Button(
@@ -638,9 +670,15 @@ class App:
             button.configure(bg=PINK if selected else BG, fg=PANEL if selected else TEXT)
 
     def _active_online_source(self):
+        if self.online_resource_mode == "theme":
+            return self.yuanqi_theme_source
         return self.yuanqi_dynamic_source if self.online_resource_mode == "dynamic" else self.yuanqi_source
 
     def _source_for_item(self, item: CatalogItem):
+        if item.resource_kind == "theme":
+            if item.id in self.yuanqi_theme_source._items_by_id:
+                return self.yuanqi_theme_source
+            return self.yuanqi_dynamic_source
         return self.yuanqi_dynamic_source if item.resource_kind == "dynamic" else self.yuanqi_source
 
     @staticmethod
@@ -650,18 +688,33 @@ class App:
     def _switch_resource_mode(self, mode: str) -> None:
         if mode not in {"static", "dynamic"}:
             return
+        self._last_wallpaper_resource_mode = mode
+        self._activate_resource_mode(mode)
+
+    def _activate_resource_mode(self, mode: str, *, reset: bool = True, load: bool = True) -> None:
+        if mode not in {"static", "dynamic", "theme"}:
+            return
         self.online_resource_mode = mode
         for key, button in self.online_mode_buttons.items():
             button.configure(bg=GOLD if key == mode else NAV_BG)
-        self.global_search_var.set("")
-        self.local_query = ""
-        self.online_query = ""
-        self.online_cate_id = "__featured__"
-        self.online_page = 1
-        self.online_search_hint.configure(text="")
-        self.render_global_local_matches("")
+        self.dynamic_mode_notice.configure(
+            text=(
+                "电脑主题仅保留 preview_video 择优静态帧并生成 Windows 原生 .theme；私有组件不接入。"
+                if mode == "theme"
+                else "动态资源仅解码 preview_video，多点选帧后生成原生 JPEG；不接入 CWP/加密视频。"
+            )
+        )
+        if reset:
+            self.global_search_var.set("")
+            self.local_query = ""
+            self.online_query = ""
+            self.online_cate_id = "__featured__"
+            self.online_page = 1
+            self.online_search_hint.configure(text="")
+            self.render_global_local_matches("")
         self._render_online_categories(self._active_online_source().list_categories())
-        self.load_online_items("__featured__", 1)
+        if load:
+            self.load_online_items("__featured__", 1)
 
     def _switch_online_category(self, cate_id: str) -> None:
         self.global_search_var.set("")
@@ -755,6 +808,7 @@ class App:
         clear_session()
         self.yuanqi_source.reset_session_cache()
         self.yuanqi_dynamic_source.reset_session_cache()
+        self.yuanqi_theme_source.reset_session_cache()
         self._online_cache.clear()
         self.online_selected_id = None
         self.login_status.configure(text=self._login_status_text())
@@ -852,9 +906,10 @@ class App:
             local_count = sum(wallpaper_matches_query(item, self.online_query) for item in self.items)
             static_count = sum(item.resource_kind == "static" for item in self.online_items)
             dynamic_count = sum(item.resource_kind == "dynamic" for item in self.online_items)
+            theme_count = sum(item.resource_kind == "theme" for item in self.online_items)
             label = (
                 f"全局结果：本地 {local_count} 张 · 联网共 {result.total or 0} 张 "
-                f"（本页静态 {static_count} / 动态 {dynamic_count}）· 第 {self.online_page} 页"
+                f"（本页静态 {static_count} / 动态 {dynamic_count} / 主题 {theme_count}）· 第 {self.online_page} 页"
             )
         else:
             label = f"第 {self.online_page} 页 · 共 {result.total or '?'} 条"
@@ -931,7 +986,11 @@ class App:
         name = tk.Label(picture, text=item.title, bg="#20232a", fg="#ffffff", anchor="w",
                         font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3)
         name.place(x=8, y=8)
-        if scene_components_may_be_baked(item):
+        if item.resource_kind == "theme":
+            meta_text = "电脑主题转原生 · 仅保留壁纸"
+            if theme_has_live_component_risk(item):
+                meta_text += " · 动态组件会固化"
+        elif scene_components_may_be_baked(item):
             meta_text = "场景转静态 · 组件可能固化"
         else:
             meta_text = "动态预览转静态" if item.resource_kind == "dynamic" else (item.category_name or "精选")
@@ -1046,10 +1105,17 @@ class App:
         if hasattr(self, "online_download_button"):
             self.online_download_button.configure(state="normal")
             self.online_apply_button.configure(state="normal")
-            dynamic = item.resource_kind == "dynamic"
-            self.online_download_button.configure(text="转换到本地" if dynamic else "下载到本地")
-            self.online_apply_button.configure(text="转换并设为壁纸" if dynamic else "下载并设为壁纸")
-        suffix = "；将从预览视频多点选取高清帧。" if item.resource_kind == "dynamic" else "；双击卡片可查看大图。"
+            if item.resource_kind == "theme":
+                self.online_download_button.configure(text="转换为原生主题")
+                self.online_apply_button.configure(text="转换并应用主题")
+            else:
+                dynamic = item.resource_kind == "dynamic"
+                self.online_download_button.configure(text="转换到本地" if dynamic else "下载到本地")
+                self.online_apply_button.configure(text="转换并设为壁纸" if dynamic else "下载并设为壁纸")
+        if item.resource_kind == "theme":
+            suffix = "；只保留壁纸并生成 Windows 原生 .theme，私有组件不会接入。"
+        else:
+            suffix = "；将从预览视频多点选取高清帧。" if item.resource_kind == "dynamic" else "；双击卡片可查看大图。"
         self.status.set(f"已选择：{item.title}{suffix}")
 
     def show_online_detail(self, item: CatalogItem | None = None) -> None:
@@ -1065,10 +1131,15 @@ class App:
         tk.Label(top, text=item.title, bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(side="left")
         meta = " · ".join(part for part in (item.category_name, item.author, item.resolution, item.format) if part)
         tk.Label(top, text=meta, bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 10)).pack(side="left", padx=12)
-        if item.resource_kind == "dynamic":
+        if item.resource_kind in {"dynamic", "theme"}:
             tk.Label(
                 dialog,
-                text="画面预览仅用于浏览；转换时会从原始 preview_video 的 5 个时间点解码全分辨率帧并自动择优，不取首帧。",
+                text=(
+                    "电脑主题会从 preview_video 的 5 个时间点择优生成静态壁纸和 Windows 原生 .theme；"
+                    "鼠标、任务栏、窗口皮肤及动态组件不接入。"
+                    if item.resource_kind == "theme"
+                    else "画面预览仅用于浏览；转换时会从原始 preview_video 的 5 个时间点解码全分辨率帧并自动择优，不取首帧。"
+                ),
                 bg=PANEL,
                 fg=PINK,
                 anchor="w",
@@ -1087,8 +1158,11 @@ class App:
             ).pack(fill="x", padx=16, pady=(0, 3))
         image_label = tk.Label(dialog, bg="#d8dce6"); image_label.pack(fill="both", expand=True, padx=16, pady=6)
         actions = tk.Frame(dialog, bg=PANEL); actions.pack(fill="x", padx=16, pady=(6, 14))
-        download_label = "转换到本地图库" if item.resource_kind == "dynamic" else "下载到本地图库"
-        apply_label = "转换并应用为壁纸" if item.resource_kind == "dynamic" else "下载并应用为壁纸"
+        if item.resource_kind == "theme":
+            download_label, apply_label = "转换为 Windows 原生主题", "转换并应用原生主题"
+        else:
+            download_label = "转换到本地图库" if item.resource_kind == "dynamic" else "下载到本地图库"
+            apply_label = "转换并应用为壁纸" if item.resource_kind == "dynamic" else "下载并应用为壁纸"
         self.button(actions, download_label, lambda: self._download_item_to_library(item)).pack(side="left", padx=(0, 8))
         self.button(actions, apply_label, lambda: self._apply_item(item)).pack(side="left", padx=(0, 8))
         self.status.set(f"正在加载大图：{item.title}")
@@ -1115,7 +1189,7 @@ class App:
             return
 
     def _online_save_target(self, item: CatalogItem) -> Path:
-        suffix = ".jpg" if item.resource_kind == "dynamic" else Path(item.original_url or "").suffix.lower()
+        suffix = ".jpg" if item.resource_kind in {"dynamic", "theme"} else Path(item.original_url or "").suffix.lower()
         if suffix not in IMAGE_EXTENSIONS:
             suffix = ".jpg"
         WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
@@ -1129,8 +1203,31 @@ class App:
         self._download_item_to_library(item)
 
     def _confirm_scene_conversion(self, item: CatalogItem) -> bool:
+        if item.resource_kind == "theme":
+            accepted = messagebox.askokcancel(
+                "电脑主题将降级为原生静态主题",
+                THEME_CONVERSION_WARNING,
+                icon="warning",
+                default="cancel",
+                parent=self.root,
+            )
+            if not accepted:
+                self.status.set("已取消转换：电脑主题的私有组件无法由 Windows 原生 .theme 承载。")
+            return accepted
         if not scene_components_may_be_baked(item):
             return True
+        if item.source_video_url:
+            # 用解密后的干净高清源视频，时间/天气 HUD 不会被烘焙进静态画面。
+            accepted = messagebox.askokcancel(
+                "使用干净源视频转换",
+                "已使用解密后的高清源视频生成静态画面，时间/天气 HUD 不会出现。\n\n继续转换？",
+                icon="question",
+                default="ok",
+                parent=self.root,
+            )
+            if not accepted:
+                self.status.set("已取消转换。")
+            return accepted
         accepted = messagebox.askokcancel(
             "场景组件会变成固定画面",
             SCENE_COMPONENT_WARNING,
@@ -1145,7 +1242,9 @@ class App:
     def _download_item_to_library(self, item: CatalogItem) -> None:
         if not self._confirm_scene_conversion(item):
             return
-        if item.resource_kind == "dynamic":
+        if item.resource_kind == "theme":
+            self.status.set(f"正在把电脑主题降级为 Windows 原生静态主题：{item.title}")
+        elif item.resource_kind == "dynamic":
             self.status.set(f"正在下载动态预览并从 5 个时间点选择高清帧：{item.title}")
         else:
             self.status.set(f"正在下载：{item.title}")
@@ -1159,9 +1258,13 @@ class App:
                 target.write_bytes(data)
                 if not is_valid_static_image(target):
                     raise CatalogError("生成文件没有通过静态图片校验")
-                if item.resource_kind == "dynamic":
+                if item.resource_kind in {"dynamic", "theme"}:
                     summary = source_adapter.conversion_summary(item.id)
-                    source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
+                    if item.resource_kind == "theme":
+                        self._write_single_wallpaper_theme(target, item.title, item.id)
+                        source_name = f"元气电脑主题转原生 · {summary}" if summary else "元气电脑主题转原生"
+                    else:
+                        source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
                 else:
                     source_name = "元气联网下载"
                 wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source=source_name)
@@ -1181,7 +1284,7 @@ class App:
         self.items.append(wallpaper)
         self.selected_id = wallpaper.id
         self.refresh()
-        conversion = wallpaper.source if wallpaper.source.startswith("元气动态预览转静态") else ""
+        conversion = wallpaper.source if wallpaper.source.startswith(("元气动态预览转静态", "元气电脑主题转原生")) else ""
         self.status.set(f"已加入本地图库：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
         detail = f"\n转换信息：{conversion}" if conversion else ""
         messagebox.showinfo("转换成功" if conversion else "下载成功", f"已把“{wallpaper.title}”加入本地图库。{detail}\n可到“本地壁纸”页预览或应用。")
@@ -1196,7 +1299,9 @@ class App:
     def _apply_item(self, item: CatalogItem) -> None:
         if not self._confirm_scene_conversion(item):
             return
-        if item.resource_kind == "dynamic":
+        if item.resource_kind == "theme":
+            self.status.set(f"正在转换并交给 Windows 原生主题机制：{item.title}")
+        elif item.resource_kind == "dynamic":
             self.status.set(f"正在转换动态预览并交给 Windows 原生壁纸接口：{item.title}")
         else:
             self.status.set(f"正在下载并应用：{item.title}")
@@ -1211,9 +1316,14 @@ class App:
                 if not is_valid_static_image(target):
                     raise CatalogError("生成文件没有通过静态图片校验")
                 set_native_wallpaper(target)
-                if item.resource_kind == "dynamic":
+                if item.resource_kind in {"dynamic", "theme"}:
                     summary = source_adapter.conversion_summary(item.id)
-                    source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
+                    if item.resource_kind == "theme":
+                        theme_path = self._write_single_wallpaper_theme(target, item.title, item.id)
+                        os.startfile(theme_path)
+                        source_name = f"元气电脑主题转原生 · {summary}" if summary else "元气电脑主题转原生"
+                    else:
+                        source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
                 else:
                     source_name = "元气联网下载"
                 wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source=source_name)
@@ -1233,8 +1343,9 @@ class App:
         self.items.append(wallpaper)
         self.selected_id = wallpaper.id
         self.refresh()
-        conversion = wallpaper.source if wallpaper.source.startswith("元气动态预览转静态") else ""
-        self.status.set(f"已应用为 Windows 原生壁纸：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
+        conversion = wallpaper.source if wallpaper.source.startswith(("元气动态预览转静态", "元气电脑主题转原生")) else ""
+        applied_kind = "Windows 原生主题" if wallpaper.source.startswith("元气电脑主题转原生") else "Windows 原生壁纸"
+        self.status.set(f"已应用为 {applied_kind}：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
         detail = f"\n转换信息：{conversion}" if conversion else ""
         messagebox.showinfo("应用成功", f"“{wallpaper.title}”已由 Windows 注册表复核应用成功。{detail}")
 
@@ -1303,6 +1414,7 @@ class App:
         self.logout_button.configure(state="normal")
         self.yuanqi_source.reset_session_cache()
         self.yuanqi_dynamic_source.reset_session_cache()
+        self.yuanqi_theme_source.reset_session_cache()
         self._online_cache.clear()
         self.load_online_items("__featured__", 1)
         messagebox.showinfo("登录成功", "已用微信扫码登录元气账号，并已加密保存在本机。\n下次启动将自动保持登录。")
@@ -1500,6 +1612,24 @@ class App:
 
     def theme_path(self) -> Path:
         return THEME_DIR / "桌面画廊-当前主题.theme"
+
+    def _write_single_wallpaper_theme(self, wallpaper_path: Path, title: str, item_id: str) -> Path:
+        """生成只含静态壁纸的标准 .theme，不冒充元气私有组件。"""
+        THEME_DIR.mkdir(parents=True, exist_ok=True)
+        safe_title = " ".join(str(title).replace("[", "（").replace("]", "）").split()) or "未命名主题"
+        key = hashlib.sha256(str(item_id).encode("utf-8")).hexdigest()[:16]
+        path = THEME_DIR / f"元气主题-{key}.theme"
+        lines = [
+            "[Theme]",
+            f"DisplayName=桌面画廊 - {safe_title}",
+            "",
+            "[Control Panel\\Desktop]",
+            f"Wallpaper={wallpaper_path.resolve()}",
+            "TileWallpaper=0",
+            "WallpaperStyle=10",
+        ]
+        path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-16")
+        return path
 
     def create_native_theme(self) -> Path | None:
         item = self.selected()

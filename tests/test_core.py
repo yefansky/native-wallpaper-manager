@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import tempfile
 import threading
@@ -15,12 +16,14 @@ import session_store as session_store
 from product import SingleInstance, autostart_command, autostart_enabled, set_autostart
 from catalog import (
     CatalogError,
+    CatalogCategory,
     CatalogItem,
     CatalogPage,
     IntegrationUnavailable,
     YuanqiDynamicResourceSource,
     YuanqiOfficialApiSource,
     YuanqiResourceSource,
+    YuanqiThemeResourceSource,
     validate_resource_preview_video_url,
 )
 from dynamic_converter import (
@@ -400,6 +403,55 @@ class CoreTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_computer_theme_nav_uses_theme_catalog_as_its_own_page(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            with patch.object(window, "load_online_items") as load_online:
+                window.show_page("theme")
+            self.assertEqual(window._current_page, "theme")
+            self.assertEqual(window.online_resource_mode, "theme")
+            self.assertIs(window._active_online_source(), window.yuanqi_theme_source)
+            self.assertEqual([button.cget("text") for button in window.online_cate_buttons.values()], ["精选"])
+            self.assertEqual(window.online_mode_row.winfo_manager(), "")
+            load_online.assert_called_once_with("__featured__", 1)
+        finally:
+            root.destroy()
+
+    def test_theme_conversion_confirmation_is_explicit_and_defaults_to_cancel(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            theme = CatalogItem(
+                "theme-1", "随真实时间变化", "https://example.test/theme.jpg",
+                resource_kind="theme", format="scene",
+            )
+            with patch.object(app.messagebox, "askokcancel", return_value=False) as confirm:
+                self.assertFalse(window._confirm_scene_conversion(theme))
+            self.assertEqual(confirm.call_args.kwargs["default"], "cancel")
+            self.assertIn("Windows 原生 .theme", confirm.call_args.args[1])
+            self.assertIn("已取消转换", window.status.get())
+        finally:
+            root.destroy()
+
+    def test_single_wallpaper_theme_contains_only_native_wallpaper_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wallpaper = root / "wallpaper.jpg"
+            Image.new("RGB", (1280, 720), "#224466").save(wallpaper)
+            with patch.object(app, "THEME_DIR", root / "themes"):
+                path = app.App._write_single_wallpaper_theme(None, wallpaper, "测试[主题]", "theme-1")
+            text = path.read_text(encoding="utf-16")
+            self.assertIn("[Theme]", text)
+            self.assertIn("[Control Panel\\Desktop]", text)
+            self.assertIn(str(wallpaper.resolve()), text)
+            self.assertNotIn("CWP", text)
+            self.assertNotIn("TaskbarTexture", text)
+
     def test_online_cards_use_three_workers_and_replace_placeholders_progressively(self):
         root = app.tk.Tk()
         root.withdraw()
@@ -641,7 +693,103 @@ class CoreTests(unittest.TestCase):
             ],
         )
 
-    def test_dynamic_list_uses_preview_video_and_never_full_video(self):
+    def test_theme_categories_follow_remote_config_order_and_filters(self):
+        source = YuanqiThemeResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}
+        )
+        config = [
+            {"cid": 1, "cname": "风景", "cate_ids": [2], "tag_ids": [], "min_mark": 2, "sort_type": 1},
+            {"cid": 9, "cname": "随时间变化", "cate_ids": [], "tag_ids": [435499], "min_mark": 2, "sort_type": 1},
+        ]
+        with patch("catalog.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": json.dumps(config, ensure_ascii=False)
+            }
+            categories = source.refresh_categories()
+        self.assertEqual(
+            [(item.id, item.title) for item in categories],
+            [("__featured__", "精选"), ("theme:1", "风景"), ("theme:9", "随时间变化")],
+        )
+        self.assertEqual(source._theme_filters["theme:9"]["tag_ids"], [435499])
+
+    def test_theme_category_uses_official_filter_contract_and_parses_components(self):
+        converted = ConvertedFrame(b"theme-jpeg", 1920, 1080, 2.0, 50.0, 5)
+        converter = unittest.mock.Mock(return_value=converted)
+        source = YuanqiThemeResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
+        )
+        source._server_categories = (CatalogCategory("theme:1", "风景"),)
+        source._theme_filters = {
+            "theme:1": {"cate_ids": [2], "tag_ids": [], "min_mark": 2, "sort_type": 1}
+        }
+        raw = {
+            "wid": 58297,
+            "wname": "赛博朋克（含时钟、系统信息）",
+            "preview_jpg_raw": "https://img-baofun.zhhainiao.com/theme.jpg",
+            "preview_video": "https://img-baofun.zhhainiao.com/theme_preview.mp4",
+            "video": "https://img-baofun.zhhainiao.com/theme_private.cwp",
+            "format": "scene",
+            "sub_wtype": 2,
+            "theme_type": 1,
+            "tag": [{"id": 20275, "tname": "主题"}],
+            "resource_detail": json.dumps({"composites": [
+                {"type": "mouse", "sub_type": "mouse_tail"},
+                {"type": "theme", "sub_type": "theme"},
+            ]}),
+        }
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": {"list": [raw], "total": 25}
+            }
+            page = source.list_items("theme:1", 1)
+        body = mock_post.call_args.kwargs["json"]
+        self.assertEqual((body["cate_ids"], body["tag_ids"], body["min_mark"], body["sort_type"]), ([2], [], 2, 1))
+        self.assertEqual((body["page"], body["page_size"]), (1, 24))
+        self.assertTrue(page.has_more)
+        self.assertEqual(page.items[0].resource_kind, "theme")
+        self.assertEqual(page.items[0].tags, ("主题",))
+        self.assertEqual(page.items[0].components, ("mouse_tail", "theme"))
+        self.assertTrue(app.theme_has_live_component_risk(page.items[0]))
+        self.assertEqual(source.download_original("58297"), b"theme-jpeg")
+        converter.assert_called_once_with(raw["preview_video"], http=source._http, decrypt=False)
+
+    def test_theme_featured_combines_carousel_and_cursor_pages(self):
+        source = YuanqiThemeResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}
+        )
+
+        def raw(wid, title):
+            return {
+                "wid": wid, "wname": title, "sub_wtype": 2, "theme_type": 1, "format": "scene",
+                "preview_jpg_raw": f"https://img-baofun.zhhainiao.com/{wid}.jpg",
+                "preview_video": f"https://img-baofun.zhhainiao.com/{wid}_preview.mp4",
+            }
+
+        def response_for(url, **kwargs):
+            response = unittest.mock.Mock()
+            if url.endswith("/wallpaper/live/themes"):
+                payload = {"resp_common": {"ret": 0}, "data": [raw(1, "轮播主题")]}
+            else:
+                cursor = kwargs["json"]["cursor"]
+                payload = (
+                    {"resp_common": {"ret": 0}, "data": [raw(2, "精选一")], "cursor": "next", "has_more": True}
+                    if not cursor
+                    else {"resp_common": {"ret": 0}, "data": [raw(3, "精选二")], "cursor": "", "has_more": False}
+                )
+            response.json.return_value = payload
+            return response
+
+        with patch("catalog.requests.post", side_effect=response_for) as mock_post:
+            first = source.list_items("__featured__", 1)
+            second = source.list_items("__featured__", 2)
+        self.assertEqual([item.id for item in first.items], ["1", "2"])
+        self.assertEqual([item.id for item in second.items], ["3"])
+        self.assertTrue(first.has_more)
+        self.assertFalse(second.has_more)
+        page_requests = [call.kwargs["json"] for call in mock_post.call_args_list if call.args[0].endswith("themes_by_page")]
+        self.assertEqual([request["cursor"] for request in page_requests], ["", "next"])
+
+    def test_dynamic_list_prefers_compatible_clean_source_video(self):
         converted = ConvertedFrame(b"jpeg-data", 1920, 1080, 3.3, 100.0, 5)
         converter = unittest.mock.Mock(return_value=converted)
         source = YuanqiDynamicResourceSource(
@@ -665,9 +813,10 @@ class CoreTests(unittest.TestCase):
         item = page.items[0]
         self.assertEqual(item.resource_kind, "dynamic")
         self.assertEqual(item.preview_video_url, raw["preview_video"])
-        self.assertNotEqual(item.preview_video_url, raw["video"])
+        # 干净高清源视频（XOR 混淆）优先于带 HUD 的 preview_video。
+        self.assertEqual(item.source_video_url, raw["video"])
         self.assertEqual(source.download_original(item.id), b"jpeg-data")
-        converter.assert_called_once_with(raw["preview_video"], http=source._http)
+        converter.assert_called_once_with(raw["video"], http=source._http, decrypt=True)
 
     def test_dynamic_global_search_uses_official_endpoint(self):
         source = YuanqiDynamicResourceSource(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import threading
 from dataclasses import dataclass
 from typing import Callable, Mapping, Protocol
@@ -30,6 +31,10 @@ DYNAMIC_SEARCH_URL = "https://pcwallpaper.zhhainiao.com/v20526/wplive/opensearch
 DYNAMIC_CATEGORY_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/live/cate_nav_v2"
 DYNAMIC_FOLLOWING_URL = "https://pcwallpaper.zhhainiao.com/v1/wallpaper/live/following/list"
 DYNAMIC_NEWEST_URL = "https://pcwallpaper.zhhainiao.com/wplive/list/newest"
+THEME_CATEGORY_URL = "https://cdnpcwallpaper.zhhainiao.com/config/get/by/ckey?ckey=theme_category"
+THEME_FEATURED_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/live/themes_by_page"
+THEME_CAROUSEL_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/live/themes"
+THEME_LIST_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/live/theme/list"
 PAGE_SIZE = 24
 SORT_HOT_DESC = 2
 SORT_TIME_DESC = 1
@@ -89,6 +94,8 @@ class CatalogItem:
     price: int = 0
     resource_kind: str = "static"
     preview_video_url: str = ""
+    source_video_url: str = ""
+    components: tuple[str, ...] = ()
 
     @property
     def search_text(self) -> str:
@@ -137,6 +144,18 @@ def validate_resource_preview_video_url(url: str) -> str:
         raise CatalogError("服务端返回了不受信任的动态预览地址")
     if not parsed.path.lower().endswith("_preview.mp4"):
         raise CatalogError("动态资源没有标准 preview_video，拒绝读取完整视频或私有容器")
+    return url
+
+
+def validate_resource_source_video_url(url: str) -> str:
+    """允许元气可信 CDN 上的正式视频或私有容器；内容仍须经解码器验证。"""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    allowed = host in RESOURCE_IMAGE_HOSTS or host.endswith(_RESOURCE_VIDEO_HOST_SUFFIXES)
+    if parsed.scheme != "https" or not allowed:
+        raise CatalogError("服务端返回了不受信任的正式视频地址")
+    if not parsed.path or parsed.path == "/":
+        raise CatalogError("服务端返回的正式视频地址缺少路径")
     return url
 
 
@@ -431,7 +450,7 @@ class YuanqiResourceSource:
 
 
 class YuanqiDynamicResourceSource(YuanqiResourceSource):
-    """元气动态目录适配器；只把标准 preview_video 转成静态 JPEG。"""
+    """元气动态目录适配器；优先正式画面，失败时回退标准预览视频。"""
 
     _SPECIAL_CATEGORIES = (
         CatalogCategory("__following__", "关注"),
@@ -443,6 +462,12 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
         super().__init__(*args, **kwargs)
         self._converter = converter
         self._converted_by_id: dict[str, ConvertedFrame] = {}
+        self._conversion_path_by_id: dict[str, str] = {}
+
+    def reset_session_cache(self) -> None:
+        super().reset_session_cache()
+        self._converted_by_id.clear()
+        self._conversion_path_by_id.clear()
 
     def capabilities(self) -> SourceCapabilities:
         configured = self._session_provider is not None and self._device_provider is not None
@@ -488,14 +513,34 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
 
     @staticmethod
     def _parse_item(raw: Mapping[str, object]) -> CatalogItem:
-        tags_raw = raw.get("tags") or []
+        tags_raw = raw.get("tags") or raw.get("tag") or []
         tags = tuple(
             str(tag.get("tname") or "")
             for tag in tags_raw
             if isinstance(tag, Mapping) and tag.get("tname")
         )
+        components: list[str] = []
+        try:
+            resource_detail = json.loads(str(raw.get("resource_detail") or "{}"))
+            composites = resource_detail.get("composites") or []
+            for composite in composites:
+                if not isinstance(composite, Mapping):
+                    continue
+                value = str(composite.get("sub_type") or composite.get("type") or "").strip()
+                if value and value not in components:
+                    components.append(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        try:
+            is_theme = int(raw.get("sub_wtype") or 0) == 2 or int(raw.get("theme_type") or 0) == 1
+        except (TypeError, ValueError):
+            is_theme = False
         preview = str(raw.get("preview_jpg_raw") or raw.get("preview_jpg_mid") or raw.get("preview_jpg") or "")
         preview_video = str(raw.get("preview_video") or "")
+        # 干净高清源视频：优先 4K/2K/1920，最后回退基础 video（均带 XOR 混淆）。
+        source_video = (
+            str(raw.get("video_4k") or raw.get("video_2k") or raw.get("video_1920") or raw.get("video") or "")
+        )
         if preview:
             validate_resource_image_url(preview)
         if preview_video:
@@ -515,8 +560,10 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
             likes=int(raw.get("likes") or 0),
             views=int(raw.get("download_count") or raw.get("view") or 0),
             price=int(raw.get("price") or raw.get("ptype") or 0),
-            resource_kind="dynamic",
+            resource_kind="theme" if is_theme else "dynamic",
             preview_video_url=preview_video,
+            source_video_url=source_video,
+            components=tuple(components),
         )
 
     def _dynamic_body(self, page: int, page_size: int) -> dict[str, object]:
@@ -581,13 +628,35 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
 
     def download_original(self, item_id: str) -> bytes:
         item = self._items_by_id.get(str(item_id))
-        if item is None or not item.preview_video_url:
-            raise CatalogError("该资源没有标准 preview_video，无法安全转换")
-        url = validate_resource_preview_video_url(item.preview_video_url)
-        try:
-            converted = self._converter(url, http=self._http)
-        except ConversionUnavailable as exc:
-            raise CatalogError(str(exc)) from exc
+        if item is None:
+            raise CatalogError("该资源不在当前结果中")
+        if not item.source_video_url and not item.preview_video_url:
+            raise CatalogError("该资源没有可用视频，无法转换")
+
+        converted: ConvertedFrame | None = None
+        source_error: ConversionUnavailable | CatalogError | None = None
+        if item.source_video_url:
+            try:
+                source_url = validate_resource_source_video_url(item.source_video_url)
+                converted = self._converter(source_url, http=self._http, decrypt=True)
+                self._conversion_path_by_id[str(item_id)] = "高清源"
+            except (ConversionUnavailable, CatalogError) as exc:
+                # 正式资源可能是真 CWP3/主题包，不能验证时安全回退标准预览视频。
+                source_error = exc
+
+        if converted is None and item.preview_video_url:
+            try:
+                preview_url = validate_resource_preview_video_url(item.preview_video_url)
+                converted = self._converter(preview_url, http=self._http, decrypt=False)
+                self._conversion_path_by_id[str(item_id)] = "预览回退" if source_error else "预览视频"
+            except ConversionUnavailable as exc:
+                if source_error is not None:
+                    raise CatalogError(f"正式资源无法解析，预览回退也失败：{exc}") from exc
+                raise CatalogError(str(exc)) from exc
+
+        if converted is None:
+            assert source_error is not None
+            raise CatalogError(f"正式资源无法解析且没有预览回退：{source_error}") from source_error
         self._converted_by_id[str(item_id)] = converted
         return converted.jpeg
 
@@ -596,10 +665,180 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
         if converted is None:
             return ""
         cache_note = " · 缓存命中" if converted.from_cache else ""
+        conversion_path = self._conversion_path_by_id.get(str(item_id), "视频")
         return (
-            f"{converted.width}×{converted.height} · "
+            f"{conversion_path} · {converted.width}×{converted.height} · "
             f"{converted.candidate_count} 点择优 · {converted.timestamp:g} 秒{cache_note}"
         )
+
+
+class YuanqiThemeResourceSource(YuanqiDynamicResourceSource):
+    """元气电脑主题目录；正式画面不可验证时降级使用标准 preview_video。"""
+
+    _SPECIAL_CATEGORIES = (CatalogCategory("__featured__", "精选"),)
+    _FEATURED_PAGE_SIZE = 12
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._theme_filters: dict[str, dict[str, object]] = {}
+        self._featured_pages: dict[int, CatalogPage] = {}
+        self._featured_cursors: dict[int, str] = {1: ""}
+        self._carousel_items: tuple[CatalogItem, ...] | None = None
+
+    def capabilities(self) -> SourceCapabilities:
+        configured = self._session_provider is not None and self._device_provider is not None
+        return SourceCapabilities(
+            source_name="元气电脑主题转 Windows 原生静态主题",
+            authorization=configured,
+            categories=True,
+            paging=True,
+            search=True,
+            preview=True,
+            original_download=False,
+            reason="" if configured else "请先用本客户端完成微信扫码登录",
+        )
+
+    def reset_session_cache(self) -> None:
+        super().reset_session_cache()
+        self._theme_filters.clear()
+        self._featured_pages.clear()
+        self._featured_cursors = {1: ""}
+        self._carousel_items = None
+
+    def refresh_categories(self) -> tuple[CatalogCategory, ...]:
+        if self._server_categories is not None:
+            return self.list_categories()
+        with self._category_lock:
+            if self._server_categories is not None:
+                return self.list_categories()
+            try:
+                response = self._http.get(THEME_CATEGORY_URL, timeout=20)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, Mapping):
+                    raise CatalogError("电脑主题导航结构错误")
+                common = payload.get("resp_common") or {}
+                if not isinstance(common, Mapping) or common.get("ret") != 0:
+                    raise CatalogError("电脑主题导航服务拒绝请求")
+                raw_categories = json.loads(str(payload.get("data") or "[]"))
+            except CatalogError:
+                raise
+            except (OSError, TypeError, ValueError, requests.RequestException, json.JSONDecodeError) as exc:
+                raise CatalogError(f"电脑主题导航加载失败：{type(exc).__name__}") from exc
+            if not isinstance(raw_categories, list):
+                raise CatalogError("电脑主题导航结构错误")
+            categories: list[CatalogCategory] = []
+            filters: dict[str, dict[str, object]] = {}
+            for raw in raw_categories:
+                if not isinstance(raw, Mapping):
+                    continue
+                try:
+                    server_id = int(raw["cid"])
+                    cate_ids = [int(value) for value in (raw.get("cate_ids") or [])]
+                    tag_ids = [int(value) for value in (raw.get("tag_ids") or [])]
+                    min_mark = int(raw.get("min_mark") or 0)
+                    sort_type = int(raw.get("sort_type") or SORT_TIME_DESC)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                title = str(raw.get("cname") or "").strip()
+                if not title:
+                    continue
+                category_id = f"theme:{server_id}"
+                categories.append(CatalogCategory(category_id, title))
+                filters[category_id] = {
+                    "cate_ids": cate_ids,
+                    "tag_ids": tag_ids,
+                    "min_mark": min_mark,
+                    "sort_type": sort_type,
+                }
+            self._theme_filters = filters
+            self._server_categories = tuple(categories)
+            return self.list_categories()
+
+    def _theme_items(self, raw_items: object) -> tuple[CatalogItem, ...]:
+        if not isinstance(raw_items, list):
+            raise CatalogError("电脑主题资源结构错误")
+        items = tuple(self._parse_item(raw) for raw in raw_items if isinstance(raw, Mapping))
+        items = tuple(item for item in items if item.resource_kind == "theme")
+        self._items_by_id.update({item.id: item for item in items if item.id})
+        return items
+
+    def _carousel(self) -> tuple[CatalogItem, ...]:
+        if self._carousel_items is None:
+            payload = self._post(
+                THEME_CAROUSEL_URL,
+                {"login_info": {}, "common": self._common()},
+            )
+            self._carousel_items = self._theme_items(payload.get("data") or ())[:3]
+        return self._carousel_items
+
+    def _featured_page(self, page: int) -> CatalogPage:
+        if page < 1:
+            raise ValueError("页码必须从 1 开始")
+        for current in range(1, page + 1):
+            if current in self._featured_pages:
+                continue
+            if current not in self._featured_cursors:
+                return CatalogPage((), page, False, 0)
+            payload = self._post(
+                THEME_FEATURED_URL,
+                {
+                    "login_info": {},
+                    "common": self._common(),
+                    "size": self._FEATURED_PAGE_SIZE,
+                    "cursor": self._featured_cursors[current],
+                    "is_new_user": 0,
+                },
+            )
+            items = self._theme_items(payload.get("data") or ())
+            if current == 1:
+                seen = {item.id for item in items}
+                items = tuple(item for item in self._carousel() if item.id not in seen) + items
+            has_more = bool(payload.get("has_more"))
+            next_cursor = str(payload.get("cursor") or "")
+            self._featured_pages[current] = CatalogPage(items, current, has_more, 0)
+            if has_more and next_cursor:
+                self._featured_cursors[current + 1] = next_cursor
+        return self._featured_pages.get(page, CatalogPage((), page, False, 0))
+
+    def _category_page(self, category_id: str, page: int) -> CatalogPage:
+        if page < 1:
+            raise ValueError("页码必须从 1 开始")
+        if self._server_categories is None:
+            self.refresh_categories()
+        filters = self._theme_filters.get(category_id)
+        if filters is None:
+            raise CatalogError("电脑主题分类不是服务端当前导航中的项目")
+        body = {
+            "common": self._common(),
+            **filters,
+            "page": page,
+            "page_size": PAGE_SIZE,
+        }
+        payload = self._post(THEME_LIST_URL, body)
+        data = payload.get("data") or {}
+        if not isinstance(data, Mapping):
+            raise CatalogError("电脑主题分类资源结构错误")
+        items = self._theme_items(data.get("list") or ())
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return CatalogPage(items, page, page * PAGE_SIZE < total, total)
+
+    def search(self, keyword: str, page: int = 1, page_size: int = PAGE_SIZE, progress_cb=None) -> CatalogPage:
+        # 元气主题页的顶部搜索会进入全局动态搜索；这里只保留其中的主题条目。
+        result = super().search(keyword, page, page_size, progress_cb)
+        items = tuple(item for item in result.items if item.resource_kind == "theme")
+        self._items_by_id.update({item.id: item for item in items if item.id})
+        return CatalogPage(items, page, result.has_more, len(items))
+
+    def list_items(self, category_id: str, page: int = 1, query: str = "") -> CatalogPage:
+        if query.strip():
+            return self.search(query, page)
+        if category_id in {"", "0", "__featured__"}:
+            return self._featured_page(page)
+        return self._category_page(category_id, page)
 
 
 class YuanqiOfficialApiSource:

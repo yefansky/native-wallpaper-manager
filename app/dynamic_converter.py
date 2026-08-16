@@ -1,7 +1,8 @@
-"""把元气标准 preview_video 安全转换为 Windows 原生静态 JPEG。
+"""把元气可解码视频安全转换为 Windows 原生静态 JPEG。
 
-这里只处理可由常规解码器读取的预览 MP4，不接触 CWP、加密完整视频或桌面播放器。
-候选帧避开片头，并以清晰度、对比度和曝光质量选择代表帧，避免直接取首帧。
+支持标准 preview MP4 和可还原为标准 MP4 的 XOR 视频流；真正的 CWP3 容器若无法
+由常规解码器验证，会由目录层明确回退到 preview_video。候选帧避开片头，并以
+清晰度、对比度和曝光质量选择代表帧，避免直接取首帧。
 """
 from __future__ import annotations
 
@@ -27,9 +28,21 @@ MAX_PREVIEW_VIDEO_BYTES = 96 * 1024 * 1024
 MIN_FRAME_WIDTH = 1280
 MIN_FRAME_HEIGHT = 720
 CACHE_VERSION = 1
+# 元气把完整高清源视频（`video`/`video_4k`）做重复密钥 XOR 混淆后下发，
+# 仅 `preview_video` 未加密但被场景 HUD 烘焙。密钥是本机官方二进制中的
+# 固定字符串，用于对用户本人已下载内容做个人格式互转；不涉及会话/设备秘密。
+CWP_VIDEO_XOR_KEY = b"djk8&$df`223jsjh"
 DYNAMIC_FRAME_CACHE_DIR = Path(
     os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
 ) / "NativeWallpaperManager" / "dynamic_frame_cache"
+
+
+def decrypt_video_bytes(data: bytes, offset: int = 0) -> bytes:
+    """对元气加密源视频字节做重复密钥 XOR 解密，返回标准 MP4。"""
+    if not data:
+        return data
+    key = CWP_VIDEO_XOR_KEY
+    return bytes(byte ^ key[(offset + index) % len(key)] for index, byte in enumerate(data))
 
 _cache_locks_guard = threading.Lock()
 _cache_locks: dict[str, threading.Lock] = {}
@@ -223,7 +236,7 @@ def frame_quality(image: Image.Image) -> float:
     return sharpness + contrast * 7.0 - exposure_penalty - low_contrast_penalty - clipped * 1800.0
 
 
-def _download_preview(url: str, path: Path, http: object) -> None:
+def _download_preview(url: str, path: Path, http: object, *, decrypt: bool = False) -> None:
     try:
         response = http.get(url, timeout=45, stream=True)
         response.raise_for_status()
@@ -235,10 +248,11 @@ def _download_preview(url: str, path: Path, http: object) -> None:
             for chunk in response.iter_content(1024 * 1024):
                 if not chunk:
                     continue
+                offset = size
                 size += len(chunk)
                 if size > MAX_PREVIEW_VIDEO_BYTES:
                     raise ConversionUnavailable("预览视频超过 96 MiB 安全上限")
-                output.write(chunk)
+                output.write(decrypt_video_bytes(chunk, offset) if decrypt else chunk)
         if size == 0:
             raise ConversionUnavailable("预览视频为空")
     except ConversionUnavailable:
@@ -255,8 +269,12 @@ def convert_preview_video_to_jpeg(
     http: object = requests,
     tool_finder: Callable[[], tuple[str, str]] = find_ffmpeg_tools,
     cache_dir: Path | None = DYNAMIC_FRAME_CACHE_DIR,
+    decrypt: bool = False,
 ) -> ConvertedFrame:
-    """下载标准 MP4，解码五个全分辨率候选帧并返回画质最佳的 JPEG。"""
+    """下载标准 MP4，解码五个全分辨率候选帧并返回画质最佳的 JPEG。
+
+    `decrypt=True` 时先对下载字节做重复密钥 XOR 解密（元气加密源视频）。
+    """
     resolved_cache_dir = Path(cache_dir) if cache_dir is not None else None
     lock = _cache_lock(url) if resolved_cache_dir is not None else nullcontext()
     with lock:
@@ -269,7 +287,7 @@ def convert_preview_video_to_jpeg(
         with tempfile.TemporaryDirectory(prefix="native-wallpaper-preview-") as temp:
             root = Path(temp)
             video = root / "preview.mp4"
-            _download_preview(url, video, http)
+            _download_preview(url, video, http, decrypt=decrypt)
             duration, expected_width, expected_height = _probe_video(video, ffprobe)
             candidates: list[tuple[float, float, Image.Image]] = []
             for index, timestamp in enumerate(candidate_timestamps(duration), start=1):
