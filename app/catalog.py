@@ -595,9 +595,10 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
         converted = self._converted_by_id.get(str(item_id))
         if converted is None:
             return ""
+        cache_note = " · 缓存命中" if converted.from_cache else ""
         return (
             f"{converted.width}×{converted.height} · "
-            f"{converted.candidate_count} 点择优 · {converted.timestamp:g} 秒"
+            f"{converted.candidate_count} 点择优 · {converted.timestamp:g} 秒{cache_note}"
         )
 
 

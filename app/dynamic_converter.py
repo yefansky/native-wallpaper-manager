@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -22,6 +26,13 @@ from PIL import Image, ImageFilter, ImageStat
 MAX_PREVIEW_VIDEO_BYTES = 96 * 1024 * 1024
 MIN_FRAME_WIDTH = 1280
 MIN_FRAME_HEIGHT = 720
+CACHE_VERSION = 1
+DYNAMIC_FRAME_CACHE_DIR = Path(
+    os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+) / "NativeWallpaperManager" / "dynamic_frame_cache"
+
+_cache_locks_guard = threading.Lock()
+_cache_locks: dict[str, threading.Lock] = {}
 
 
 class ConversionUnavailable(RuntimeError):
@@ -36,6 +47,93 @@ class ConvertedFrame:
     timestamp: float
     score: float
     candidate_count: int
+    from_cache: bool = False
+
+
+def cache_key(url: str) -> str:
+    """URL 只用于生成稳定键，不把元气地址写进缓存元数据。"""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def _cache_paths(url: str, cache_dir: Path) -> tuple[Path, Path]:
+    key = cache_key(url)
+    return cache_dir / f"{key}.jpg", cache_dir / f"{key}.json"
+
+
+def _cache_lock(url: str) -> threading.Lock:
+    key = cache_key(url)
+    with _cache_locks_guard:
+        return _cache_locks.setdefault(key, threading.Lock())
+
+
+def load_cached_frame(url: str, cache_dir: Path = DYNAMIC_FRAME_CACHE_DIR) -> ConvertedFrame | None:
+    jpeg_path, metadata_path = _cache_paths(url, Path(cache_dir))
+    try:
+        jpeg = jpeg_path.read_bytes()
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("version") != CACHE_VERSION or not jpeg:
+            raise ValueError("cache version mismatch")
+        with Image.open(io.BytesIO(jpeg)) as decoded:
+            if decoded.format != "JPEG":
+                raise ValueError("cached frame is not JPEG")
+            decoded.load()
+            width, height = decoded.size
+        if width < MIN_FRAME_WIDTH or height < MIN_FRAME_HEIGHT:
+            raise ValueError("cached frame is below minimum resolution")
+        if (width, height) != (int(metadata["width"]), int(metadata["height"])):
+            raise ValueError("cached frame dimensions mismatch")
+        timestamp = float(metadata["timestamp"])
+        score = float(metadata["score"])
+        candidate_count = int(metadata["candidate_count"])
+        if not math.isfinite(timestamp) or not math.isfinite(score) or candidate_count < 1:
+            raise ValueError("cached frame metadata is invalid")
+        return ConvertedFrame(jpeg, width, height, timestamp, score, candidate_count, True)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        # 损坏或旧版本缓存不能影响正常转换；下次转换会原子重建。
+        try:
+            jpeg_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+def store_cached_frame(
+    url: str,
+    frame: ConvertedFrame,
+    cache_dir: Path = DYNAMIC_FRAME_CACHE_DIR,
+) -> None:
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    jpeg_path, metadata_path = _cache_paths(url, cache_dir)
+    metadata = {
+        "version": CACHE_VERSION,
+        "width": frame.width,
+        "height": frame.height,
+        "timestamp": frame.timestamp,
+        "score": frame.score,
+        "candidate_count": frame.candidate_count,
+    }
+    temp_jpeg: Path | None = None
+    temp_metadata: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=cache_dir, suffix=".jpg.tmp") as output:
+            output.write(frame.jpeg)
+            temp_jpeg = Path(output.name)
+        with tempfile.NamedTemporaryFile(
+            "w", delete=False, dir=cache_dir, suffix=".json.tmp", encoding="utf-8"
+        ) as output:
+            json.dump(metadata, output, ensure_ascii=False, separators=(",", ":"))
+            temp_metadata = Path(output.name)
+        os.replace(temp_jpeg, jpeg_path)
+        temp_jpeg = None
+        os.replace(temp_metadata, metadata_path)
+        temp_metadata = None
+    finally:
+        if temp_jpeg is not None:
+            temp_jpeg.unlink(missing_ok=True)
+        if temp_metadata is not None:
+            temp_metadata.unlink(missing_ok=True)
 
 
 def _bundled_winget_tool(name: str) -> str | None:
@@ -156,53 +254,69 @@ def convert_preview_video_to_jpeg(
     *,
     http: object = requests,
     tool_finder: Callable[[], tuple[str, str]] = find_ffmpeg_tools,
+    cache_dir: Path | None = DYNAMIC_FRAME_CACHE_DIR,
 ) -> ConvertedFrame:
     """下载标准 MP4，解码五个全分辨率候选帧并返回画质最佳的 JPEG。"""
-    ffmpeg, ffprobe = tool_finder()
-    with tempfile.TemporaryDirectory(prefix="native-wallpaper-preview-") as temp:
-        root = Path(temp)
-        video = root / "preview.mp4"
-        _download_preview(url, video, http)
-        duration, expected_width, expected_height = _probe_video(video, ffprobe)
-        candidates: list[tuple[float, float, Image.Image]] = []
-        for index, timestamp in enumerate(candidate_timestamps(duration), start=1):
-            frame_path = root / f"candidate-{index}.png"
-            _run(
-                [
-                    ffmpeg,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-ss",
-                    f"{timestamp:.3f}",
-                    "-i",
-                    str(video),
-                    "-map",
-                    "0:v:0",
-                    "-frames:v",
-                    "1",
-                    "-an",
-                    "-compression_level",
-                    "3",
-                    str(frame_path),
-                ],
-                45,
-            )
-            try:
-                with Image.open(frame_path) as decoded:
-                    image = decoded.convert("RGB")
-                    image.load()
-            except OSError as exc:
-                raise ConversionUnavailable("候选帧不是有效图片") from exc
-            if image.size != (expected_width, expected_height):
-                raise ConversionUnavailable("解码帧尺寸与视频流元数据不一致")
-            candidates.append((frame_quality(image), timestamp, image))
-        if not candidates:
-            raise ConversionUnavailable("没有提取到可用候选帧")
-        score, timestamp, best = max(candidates, key=lambda value: value[0])
-        output = io.BytesIO()
-        best.save(output, format="JPEG", quality=95, subsampling=0, optimize=True)
-        jpeg = output.getvalue()
-        with Image.open(io.BytesIO(jpeg)) as verified:
-            verified.verify()
-        return ConvertedFrame(jpeg, best.width, best.height, timestamp, score, len(candidates))
+    resolved_cache_dir = Path(cache_dir) if cache_dir is not None else None
+    lock = _cache_lock(url) if resolved_cache_dir is not None else nullcontext()
+    with lock:
+        if resolved_cache_dir is not None:
+            cached = load_cached_frame(url, resolved_cache_dir)
+            if cached is not None:
+                return cached
+
+        ffmpeg, ffprobe = tool_finder()
+        with tempfile.TemporaryDirectory(prefix="native-wallpaper-preview-") as temp:
+            root = Path(temp)
+            video = root / "preview.mp4"
+            _download_preview(url, video, http)
+            duration, expected_width, expected_height = _probe_video(video, ffprobe)
+            candidates: list[tuple[float, float, Image.Image]] = []
+            for index, timestamp in enumerate(candidate_timestamps(duration), start=1):
+                frame_path = root / f"candidate-{index}.png"
+                _run(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        f"{timestamp:.3f}",
+                        "-i",
+                        str(video),
+                        "-map",
+                        "0:v:0",
+                        "-frames:v",
+                        "1",
+                        "-an",
+                        "-compression_level",
+                        "3",
+                        str(frame_path),
+                    ],
+                    45,
+                )
+                try:
+                    with Image.open(frame_path) as decoded:
+                        image = decoded.convert("RGB")
+                        image.load()
+                except OSError as exc:
+                    raise ConversionUnavailable("候选帧不是有效图片") from exc
+                if image.size != (expected_width, expected_height):
+                    raise ConversionUnavailable("解码帧尺寸与视频流元数据不一致")
+                candidates.append((frame_quality(image), timestamp, image))
+            if not candidates:
+                raise ConversionUnavailable("没有提取到可用候选帧")
+            score, timestamp, best = max(candidates, key=lambda value: value[0])
+            output = io.BytesIO()
+            best.save(output, format="JPEG", quality=95, subsampling=0, optimize=True)
+            jpeg = output.getvalue()
+            with Image.open(io.BytesIO(jpeg)) as verified:
+                verified.verify()
+            converted = ConvertedFrame(jpeg, best.width, best.height, timestamp, score, len(candidates))
+            if resolved_cache_dir is not None:
+                try:
+                    store_cached_frame(url, converted, resolved_cache_dir)
+                except OSError:
+                    # 缓存不可写时仍返回转换成果，不让优化路径破坏核心功能。
+                    pass
+            return converted

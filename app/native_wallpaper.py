@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import winreg
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import requests
 from dataclasses import asdict, dataclass
@@ -296,7 +297,13 @@ class App:
         self.online_total = 0
         self._online_cache: dict[tuple[str, str, int, str], object] = {}
         self._thumb_cache: dict[str, bytes] = {}
+        self._thumb_cache_lock = threading.Lock()
+        self._thumbnail_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="wallpaper-preview")
+        self._thumbnail_futures: set[Future] = set()
+        self._thumbnail_futures_lock = threading.Lock()
+        self._preview_generation = 0
         self._online_card_widgets: dict[str, tk.Frame] = {}
+        self._online_image_widgets: dict[str, tk.Label] = {}
         self._loading_online = False
         self._ui_queue: queue.Queue = queue.Queue()
         self.root.after(80, self._poll_ui_queue)
@@ -703,6 +710,7 @@ class App:
         self._safe_after(self._quit_app)
 
     def _quit_app(self) -> None:
+        self._thumbnail_executor.shutdown(wait=False, cancel_futures=True)
         try:
             self.tray_icon.stop()
         except Exception:
@@ -868,9 +876,15 @@ class App:
                  font=("Microsoft YaHei UI", 11)).pack(pady=44)
 
     def _clear_online_grid(self) -> None:
+        self._preview_generation += 1
+        with self._thumbnail_futures_lock:
+            for future in self._thumbnail_futures:
+                future.cancel()
+            self._thumbnail_futures.clear()
         for child in self.online_grid.winfo_children():
             child.destroy()
         self._online_card_widgets = {}
+        self._online_image_widgets = {}
         self.online_photo_refs.clear()
         self.online_items = []
         self.online_selected_id = None
@@ -878,7 +892,10 @@ class App:
             self.online_download_button.configure(state="disabled")
             self.online_apply_button.configure(state="disabled")
 
-    def _render_online_grid_batched(self, start: int = 0) -> None:
+    def _render_online_grid_batched(self, start: int = 0, generation: int | None = None) -> None:
+        generation = self._preview_generation if generation is None else generation
+        if generation != self._preview_generation:
+            return
         batch = 6
         end = min(start + batch, len(self.online_items))
         for index in range(start, end):
@@ -888,7 +905,7 @@ class App:
             self.online_grid.grid_columnconfigure(index % 3, weight=1)
             self._online_card_widgets[self._catalog_item_key(item)] = card
         if end < len(self.online_items):
-            self.root.after_idle(lambda: self._render_online_grid_batched(end))
+            self.root.after_idle(lambda: self._render_online_grid_batched(end, generation))
         else:
             self._update_online_borders()
 
@@ -896,8 +913,11 @@ class App:
         selected = self._catalog_item_key(item) == self.online_selected_id
         card = tk.Frame(self.online_grid, bg=PANEL, highlightbackground=GOLD if selected else PANEL,
                         highlightthickness=3 if selected else 0, cursor="hand2")
-        photo = self.online_thumbnail_for(item, (380, 214)); self.online_photo_refs.append(photo)
+        photo = self._placeholder_thumbnail((380, 214)); self.online_photo_refs.append(photo)
         picture = tk.Label(card, image=photo, bg=PANEL, cursor="hand2", bd=0); picture.pack(fill="x")
+        picture._photo = photo
+        item_key = self._catalog_item_key(item)
+        self._online_image_widgets[item_key] = picture
         name = tk.Label(picture, text=item.title, bg="#20232a", fg="#ffffff", anchor="w",
                         font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3)
         name.place(x=8, y=8)
@@ -909,6 +929,7 @@ class App:
         for widget in (card, picture, name, meta):
             widget.bind("<Button-1>", lambda _event, current=item: self.select_online(current))
             widget.bind("<Double-Button-1>", lambda _event, current=item: self.show_online_detail(current))
+        self._queue_online_thumbnail(item, picture, (380, 214), self._preview_generation)
         return card
 
     def _update_online_borders(self) -> None:
@@ -916,23 +937,92 @@ class App:
             sel = item_id == self.online_selected_id
             card.configure(highlightbackground=GOLD if sel else PANEL, highlightthickness=3 if sel else 0)
 
-    def online_thumbnail_for(self, item: CatalogItem, size: tuple[int, int]) -> ImageTk.PhotoImage:
-        raw = self._thumb_cache.get(item.preview_url)
+    @staticmethod
+    def _placeholder_thumbnail(size: tuple[int, int]) -> ImageTk.PhotoImage:
+        image = Image.new("RGB", size, "#d8dce6")
+        draw = ImageDraw.Draw(image)
+        width, height = size
+        draw.rectangle((width // 2 - 18, height // 2 - 12, width // 2 + 18, height // 2 + 12),
+                       outline="#aeb5c2", width=2)
+        return ImageTk.PhotoImage(image)
+
+    def _fetch_online_thumbnail_image(self, item: CatalogItem, size: tuple[int, int]) -> Image.Image:
+        with self._thumb_cache_lock:
+            raw = self._thumb_cache.get(item.preview_url)
         if raw is None:
             try:
                 response = requests.get(item.preview_url, timeout=20)
+                response.raise_for_status()
                 raw = response.content
-                self._thumb_cache[item.preview_url] = raw
+                if len(raw) > 16 * 1024 * 1024:
+                    raise ValueError("thumbnail exceeds limit")
             except (OSError, ValueError, requests.RequestException):
                 raw = b""
         try:
             if raw:
-                image = Image.open(io.BytesIO(raw)).convert("RGB")
+                with Image.open(io.BytesIO(raw)) as decoded:
+                    image = decoded.convert("RGB")
+                    image.load()
+                with self._thumb_cache_lock:
+                    self._thumb_cache[item.preview_url] = raw
             else:
                 raise ValueError("no cached bytes")
         except (OSError, ValueError):
             image = Image.new("RGB", size, "#d8dce6")
-        return ImageTk.PhotoImage(ImageOps.fit(image, size, Image.Resampling.LANCZOS))
+        return ImageOps.fit(image, size, Image.Resampling.LANCZOS)
+
+    def _queue_online_thumbnail(
+        self,
+        item: CatalogItem,
+        label: tk.Label,
+        size: tuple[int, int],
+        generation: int,
+    ) -> None:
+        item_key = self._catalog_item_key(item)
+        try:
+            future = self._thumbnail_executor.submit(self._fetch_online_thumbnail_image, item, size)
+        except RuntimeError:
+            return
+        with self._thumbnail_futures_lock:
+            self._thumbnail_futures.add(future)
+
+        def completed(done: Future) -> None:
+            with self._thumbnail_futures_lock:
+                self._thumbnail_futures.discard(done)
+            if done.cancelled():
+                return
+            try:
+                image = done.result()
+            except Exception:
+                return
+            self._safe_after(
+                lambda current=image: self._apply_online_thumbnail(item_key, label, current, generation)
+            )
+
+        future.add_done_callback(completed)
+
+    def _apply_online_thumbnail(
+        self,
+        item_key: str,
+        label: tk.Label,
+        image: Image.Image,
+        generation: int,
+    ) -> None:
+        if generation != self._preview_generation or self._online_image_widgets.get(item_key) is not label:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            photo = ImageTk.PhotoImage(image)
+            label._photo = photo
+            label.configure(image=photo)
+            self.online_photo_refs.append(photo)
+        except tk.TclError:
+            return
+
+    def online_thumbnail_for(self, item: CatalogItem, size: tuple[int, int]) -> ImageTk.PhotoImage:
+        """兼容同步调用点；联网卡片本身使用三线程渐进加载。"""
+        return ImageTk.PhotoImage(self._fetch_online_thumbnail_image(item, size))
 
     def selected_online(self) -> CatalogItem | None:
         return next((item for item in self.online_items if self._catalog_item_key(item) == self.online_selected_id), None)
@@ -987,9 +1077,18 @@ class App:
         except (OSError, ValueError, requests.RequestException):
             image = Image.new("RGB", (820, 460), "#d8dce6")
         image.thumbnail((860, 480), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image)
-        label._photo = photo  # 持有引用，防止被 GC
-        self._safe_after(lambda: label.configure(image=photo))
+        self._safe_after(lambda current=image: self._apply_detail_image(label, current))
+
+    @staticmethod
+    def _apply_detail_image(label: tk.Label, image: Image.Image) -> None:
+        try:
+            if not label.winfo_exists():
+                return
+            photo = ImageTk.PhotoImage(image)
+            label._photo = photo  # 持有引用，防止被 GC
+            label.configure(image=photo)
+        except tk.TclError:
+            return
 
     def _online_save_target(self, item: CatalogItem) -> Path:
         suffix = ".jpg" if item.resource_kind == "dynamic" else Path(item.original_url or "").suffix.lower()

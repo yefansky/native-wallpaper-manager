@@ -1,5 +1,8 @@
+import io
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -20,7 +23,14 @@ from catalog import (
     YuanqiResourceSource,
     validate_resource_preview_video_url,
 )
-from dynamic_converter import ConvertedFrame, candidate_timestamps, frame_quality
+from dynamic_converter import (
+    ConvertedFrame,
+    candidate_timestamps,
+    convert_preview_video_to_jpeg,
+    frame_quality,
+    load_cached_frame,
+    store_cached_frame,
+)
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -281,6 +291,34 @@ class CoreTests(unittest.TestCase):
         blurred = sharp.filter(ImageFilter.GaussianBlur(8))
         self.assertGreater(frame_quality(sharp), frame_quality(blurred))
 
+    def test_dynamic_conversion_cache_is_validated_and_bypasses_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = io.BytesIO()
+            Image.new("RGB", (1280, 720), "#336699").save(output, format="JPEG", quality=95)
+            url = "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/preview/cache_preview.mp4"
+            original = ConvertedFrame(output.getvalue(), 1280, 720, 2.5, 88.0, 5)
+            store_cached_frame(url, original, Path(temp))
+
+            finder = unittest.mock.Mock(side_effect=AssertionError("cache hit must not invoke ffmpeg"))
+            cached = convert_preview_video_to_jpeg(url, cache_dir=Path(temp), tool_finder=finder)
+
+            finder.assert_not_called()
+            self.assertTrue(cached.from_cache)
+            self.assertEqual((cached.width, cached.height), (1280, 720))
+            self.assertEqual(cached.jpeg, original.jpeg)
+
+    def test_dynamic_conversion_cache_discards_corrupt_jpeg(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp)
+            output = io.BytesIO()
+            Image.new("RGB", (1280, 720), "#112233").save(output, format="JPEG")
+            url = "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/preview/corrupt_preview.mp4"
+            store_cached_frame(url, ConvertedFrame(output.getvalue(), 1280, 720, 1.0, 1.0, 5), cache_root)
+            next(cache_root.glob("*.jpg")).write_bytes(b"not-a-jpeg")
+
+            self.assertIsNone(load_cached_frame(url, cache_root))
+            self.assertEqual(list(cache_root.iterdir()), [])
+
     def test_dynamic_preview_rejects_full_video_path(self):
         with self.assertRaises(CatalogError):
             validate_resource_preview_video_url(
@@ -336,6 +374,47 @@ class CoreTests(unittest.TestCase):
             )
             load_online.assert_called_once_with("__featured__", 1)
         finally:
+            root.destroy()
+
+    def test_online_cards_use_three_workers_and_replace_placeholders_progressively(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        release = threading.Event()
+        started = threading.Event()
+        callbacks = []
+        window = None
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            self.assertEqual(window._thumbnail_executor._max_workers, 3)
+            item = CatalogItem("progressive", "渐进预览", "https://example.test/preview.jpg")
+
+            def delayed_preview(_item, size):
+                started.set()
+                release.wait(2)
+                return Image.new("RGB", size, "#ff3366")
+
+            with patch.object(window, "_fetch_online_thumbnail_image", side_effect=delayed_preview), patch.object(
+                window, "_safe_after", side_effect=callbacks.append
+            ):
+                before = time.perf_counter()
+                window._online_card(item)
+                elapsed = time.perf_counter() - before
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(started.wait(1))
+                label = window._online_image_widgets[window._catalog_item_key(item)]
+                placeholder_name = str(label.cget("image"))
+                release.set()
+                deadline = time.monotonic() + 2
+                while not callbacks and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(callbacks)
+                callbacks.pop(0)()
+                self.assertNotEqual(str(label.cget("image")), placeholder_name)
+        finally:
+            release.set()
+            if window is not None:
+                window._thumbnail_executor.shutdown(wait=True, cancel_futures=True)
             root.destroy()
 
     def test_global_online_search_merges_static_and_dynamic_results(self):
