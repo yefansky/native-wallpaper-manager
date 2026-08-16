@@ -800,6 +800,101 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(app.file_digest(copied), app.file_digest(source))
                 self.assertEqual(app.copy_yuanqi_cache_images([source], [copied]), [])
 
+    def test_local_library_deduplicates_exact_content_and_merges_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first.jpg"
+            duplicate = root / "duplicate.jpg"
+            unique = root / "unique.jpg"
+            Image.new("RGB", (80, 50), "#66aaff").save(first)
+            duplicate.write_bytes(first.read_bytes())
+            Image.new("RGB", (80, 50), "#ffaa66").save(unique)
+            items = [
+                app.Wallpaper("first", str(first), "同图旧记录", False, "旧来源"),
+                app.Wallpaper("preferred", str(duplicate), "同图当前记录", True, "新来源"),
+                app.Wallpaper("unique", str(unique), "独立图片"),
+            ]
+
+            kept, aliases, redundant = app.deduplicate_wallpapers(items, preferred_id="preferred")
+
+            self.assertEqual([item.id for item in kept], ["preferred", "unique"])
+            self.assertTrue(kept[0].favorite)
+            self.assertEqual(aliases, {"first": "preferred"})
+            self.assertEqual(redundant, [first])
+
+    def test_wallpaper_digest_reuses_valid_metadata_and_refreshes_changed_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wallpaper.jpg"
+            Image.new("RGB", (80, 50), "#66aaff").save(path)
+            item = app.Wallpaper("id", str(path), "缓存哈希")
+            first = app.wallpaper_digest(item)
+            with patch.object(app, "file_digest", side_effect=AssertionError("valid cache must be reused")):
+                self.assertEqual(app.wallpaper_digest(item), first)
+
+            Image.new("RGB", (81, 50), "#ffaa66").save(path)
+            refreshed = app.wallpaper_digest(item)
+            self.assertNotEqual(refreshed, first)
+            self.assertEqual(item.content_size, path.stat().st_size)
+
+    def test_duplicate_cleanup_is_scoped_to_unreferenced_library_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            library = root / "library"
+            library.mkdir()
+            kept = library / "kept.jpg"
+            duplicate = library / "duplicate.jpg"
+            outside = root / "outside.jpg"
+            for path in (kept, duplicate, outside):
+                Image.new("RGB", (40, 30), "#336699").save(path)
+
+            detected = app.find_unreferenced_duplicate_files([kept], library)
+            self.assertEqual(detected, [duplicate])
+
+            removed = app.cleanup_redundant_wallpaper_files(
+                [duplicate, kept, outside],
+                [kept],
+                wallpaper_dir=library,
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(duplicate.exists())
+            self.assertTrue(kept.exists())
+            self.assertTrue(outside.exists())
+
+    def test_repeated_download_reuses_record_and_apply_replaces_owned_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            library = Path(temp)
+            original = library / "original.jpg"
+            downloaded = library / "downloaded.jpg"
+            applied = library / "applied.jpg"
+            Image.new("RGB", (80, 50), "#88aaff").save(original)
+            downloaded.write_bytes(original.read_bytes())
+            applied.write_bytes(original.read_bytes())
+            existing = app.Wallpaper("existing", str(original), "已有壁纸")
+            harness = object.__new__(app.App)
+            harness.items = [existing]
+            harness._content_index = {app.file_digest(original): existing}
+
+            with patch.object(app, "WALLPAPER_DIR", library):
+                stored, added = harness._add_or_merge_wallpaper(
+                    app.Wallpaper("download", str(downloaded), "重复下载")
+                )
+                self.assertFalse(added)
+                self.assertIs(stored, existing)
+                self.assertEqual(len(harness.items), 1)
+                self.assertFalse(downloaded.exists())
+                self.assertTrue(original.exists())
+
+                stored, added = harness._add_or_merge_wallpaper(
+                    app.Wallpaper("apply", str(applied), "重新应用", source="新转换"),
+                    prefer_candidate_path=True,
+                )
+                self.assertFalse(added)
+                self.assertIs(stored, existing)
+                self.assertEqual(Path(existing.path), applied)
+                self.assertFalse(original.exists())
+                self.assertTrue(applied.exists())
+
     def test_no_desktop_overlay_or_explorer_injection(self):
         source = (Path(__file__).parents[1] / "app" / "native_wallpaper.py").read_text(encoding="utf-8")
         forbidden = ("WorkerW", "SetParent", "Progman", "FindWindowW", "ShowWindow", "SHELLDLL_DefView")

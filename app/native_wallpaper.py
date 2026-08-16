@@ -120,6 +120,9 @@ class Wallpaper:
     title: str
     favorite: bool = False
     source: str = "本地导入"
+    content_hash: str = ""
+    content_size: int = 0
+    content_mtime_ns: int = 0
 
 
 def wallpaper_matches_query(item: Wallpaper, query: str) -> bool:
@@ -209,6 +212,144 @@ def file_digest(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def wallpaper_digest(item: Wallpaper) -> str:
+    """复用经过大小和修改时间校验的内容哈希，文件变化时才重算。"""
+    path = Path(item.path)
+    stat = path.stat()
+    cached_hash = str(item.content_hash).casefold()
+    if (
+        len(cached_hash) == 64
+        and all(character in "0123456789abcdef" for character in cached_hash)
+        and item.content_size == stat.st_size
+        and item.content_mtime_ns == stat.st_mtime_ns
+    ):
+        return cached_hash
+    fingerprint = file_digest(path)
+    item.content_hash = fingerprint
+    item.content_size = stat.st_size
+    item.content_mtime_ns = stat.st_mtime_ns
+    return fingerprint
+
+
+def deduplicate_wallpapers(
+    items: list[Wallpaper],
+    preferred_id: str = "",
+    preferred_path: Path | None = None,
+) -> tuple[list[Wallpaper], dict[str, str], list[Path]]:
+    """按文件内容合并图库记录；只认完整 SHA-256，不误删相似画面。"""
+    groups: dict[str, list[tuple[int, Wallpaper]]] = {}
+    unhashable: list[tuple[int, Wallpaper]] = []
+    for index, item in enumerate(items):
+        try:
+            fingerprint = wallpaper_digest(item)
+        except OSError:
+            unhashable.append((index, item))
+            continue
+        groups.setdefault(fingerprint, []).append((index, item))
+
+    preferred_path_key = (
+        os.path.normcase(os.path.abspath(preferred_path)) if preferred_path is not None else ""
+    )
+    kept_with_order: list[tuple[int, Wallpaper]] = list(unhashable)
+    id_aliases: dict[str, str] = {}
+    redundant_paths: list[Path] = []
+    for entries in groups.values():
+        first_index = entries[0][0]
+
+        def preference(entry: tuple[int, Wallpaper]) -> tuple[int, int, int]:
+            index, item = entry
+            path_key = os.path.normcase(os.path.abspath(item.path))
+            return (path_key == preferred_path_key, item.id == preferred_id, -index)
+
+        _kept_index, kept = max(entries, key=preference)
+        kept.favorite = any(item.favorite for _index, item in entries)
+        kept_with_order.append((first_index, kept))
+        for _index, duplicate in entries:
+            if duplicate is kept:
+                continue
+            if duplicate.id:
+                id_aliases[duplicate.id] = kept.id
+            if not same_windows_path(Path(duplicate.path), Path(kept.path)):
+                redundant_paths.append(Path(duplicate.path))
+    kept_with_order.sort(key=lambda value: value[0])
+    return [item for _index, item in kept_with_order], id_aliases, redundant_paths
+
+
+def cleanup_redundant_wallpaper_files(
+    candidates: list[Path],
+    referenced_paths: list[Path],
+    current_wallpaper: Path | None = None,
+    wallpaper_dir: Path | None = None,
+) -> int:
+    """仅删除资料库目录内、已无记录引用且不是当前桌面的精确重复副本。"""
+    try:
+        library_root = (wallpaper_dir or WALLPAPER_DIR).resolve()
+    except OSError:
+        return 0
+    referenced = {
+        os.path.normcase(os.path.abspath(path)) for path in referenced_paths
+    }
+    current_key = (
+        os.path.normcase(os.path.abspath(current_wallpaper)) if current_wallpaper is not None else ""
+    )
+    removed = 0
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(library_root)
+        except (OSError, ValueError):
+            continue
+        path_key = os.path.normcase(os.path.abspath(resolved))
+        if (
+            path_key in referenced
+            or path_key == current_key
+            or resolved.suffix.lower() not in IMAGE_EXTENSIONS
+            or not resolved.is_file()
+        ):
+            continue
+        try:
+            resolved.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def find_unreferenced_duplicate_files(
+    referenced_paths: list[Path],
+    wallpaper_dir: Path | None = None,
+    referenced_hashes: set[str] | None = None,
+) -> list[Path]:
+    """找出资料库中无记录引用、但内容与有效记录完全相同的历史遗留副本。"""
+    library_root = wallpaper_dir or WALLPAPER_DIR
+    if not library_root.is_dir():
+        return []
+    referenced_keys: set[str] = set()
+    known_hashes: set[str] = set(referenced_hashes or ())
+    for path in referenced_paths:
+        try:
+            referenced_keys.add(os.path.normcase(os.path.abspath(path.resolve())))
+            if referenced_hashes is None:
+                known_hashes.add(file_digest(path))
+        except OSError:
+            continue
+    duplicates: list[Path] = []
+    try:
+        candidates = list(library_root.iterdir())
+    except OSError:
+        return []
+    for candidate in candidates:
+        candidate_key = os.path.normcase(os.path.abspath(candidate))
+        if candidate_key in referenced_keys or not is_valid_static_image(candidate):
+            continue
+        try:
+            if file_digest(candidate) in known_hashes:
+                duplicates.append(candidate)
+        except OSError:
+            continue
+    return duplicates
 
 
 def is_valid_static_image(path: Path) -> bool:
@@ -359,7 +500,29 @@ class App:
         self._ui_queue: queue.Queue = queue.Queue()
         self.root.after(80, self._poll_ui_queue)
         threading.Thread(target=self._try_restore_session, daemon=True).start()
-        self.items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
+        loaded_items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
+        try:
+            native_wallpaper = current_native_wallpaper()
+        except OSError:
+            native_wallpaper = None
+        self.items, id_aliases, redundant_paths = deduplicate_wallpapers(
+            loaded_items,
+            str(self.config.get("last_applied", "")),
+            native_wallpaper,
+        )
+        if str(self.config.get("last_applied", "")) in id_aliases:
+            self.config["last_applied"] = id_aliases[str(self.config["last_applied"])]
+        self._content_index: dict[str, Wallpaper] = {}
+        for wallpaper in self.items:
+            try:
+                self._content_index[wallpaper_digest(wallpaper)] = wallpaper
+            except OSError:
+                pass
+        referenced_paths = [Path(item.path) for item in self.items]
+        self._startup_redundant_paths = redundant_paths + find_unreferenced_duplicate_files(
+            referenced_paths,
+            referenced_hashes=set(self._content_index),
+        )
         self.filter_favorites = False
         self.local_query = ""
         self.local_page = 0
@@ -370,6 +533,16 @@ class App:
         self.photo_refs: list[ImageTk.PhotoImage] = []
         self._build()
         self.refresh()
+        removed_duplicates = cleanup_redundant_wallpaper_files(
+            self._startup_redundant_paths,
+            [Path(item.path) for item in self.items],
+            native_wallpaper,
+        )
+        if id_aliases:
+            self.status.set(
+                f"已自动合并 {len(id_aliases)} 条内容完全相同的壁纸记录"
+                + (f"，并清理 {removed_duplicates} 个重复文件。" if removed_duplicates else "。")
+            )
         self.schedule_next()
         self._init_tray()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1659,13 +1832,17 @@ class App:
             self.status.set(f"下载失败：{error}")
             messagebox.showerror("下载失败", str(error))
             return
-        self.items.append(wallpaper)
+        wallpaper, added = self._add_or_merge_wallpaper(wallpaper)
         self.selected_id = wallpaper.id
         self.refresh()
         conversion = wallpaper.source if wallpaper.source.startswith(("元气动态预览转静态", "元气电脑主题转原生")) else ""
-        self.status.set(f"已加入本地图库：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
+        self.status.set(
+            (f"已加入本地图库：{wallpaper.title}" if added else f"本地图库已有相同画面，未重复添加：{wallpaper.title}")
+            + (f"（{conversion}）" if conversion else "")
+        )
         detail = f"\n转换信息：{conversion}" if conversion else ""
-        messagebox.showinfo("转换成功" if conversion else "下载成功", f"已把“{wallpaper.title}”加入本地图库。{detail}\n可到“本地壁纸”页预览或应用。")
+        result_text = "已加入本地图库" if added else "本地图库已有相同画面，本次没有重复添加"
+        messagebox.showinfo("转换成功" if conversion else "下载成功", f"“{wallpaper.title}”{result_text}。{detail}\n可到“本地壁纸”页预览或应用。")
 
     def apply_online_selected(self) -> None:
         item = self.selected_online()
@@ -1718,8 +1895,9 @@ class App:
             self.status.set(f"应用失败：{error}")
             messagebox.showerror("应用失败", str(error))
             return
-        self.items.append(wallpaper)
+        wallpaper, _added = self._add_or_merge_wallpaper(wallpaper, prefer_candidate_path=True)
         self.selected_id = wallpaper.id
+        self.config["last_applied"] = wallpaper.id
         self.refresh()
         conversion = wallpaper.source if wallpaper.source.startswith(("元气动态预览转静态", "元气电脑主题转原生")) else ""
         applied_kind = "Windows 原生主题" if wallpaper.source.startswith("元气电脑主题转原生") else "Windows 原生壁纸"
@@ -1904,6 +2082,46 @@ class App:
         self.config["items"] = [asdict(item) for item in self.items]
         save_config(self.config)
 
+    def _add_or_merge_wallpaper(
+        self,
+        candidate: Wallpaper,
+        *,
+        prefer_candidate_path: bool = False,
+    ) -> tuple[Wallpaper, bool]:
+        """加入唯一内容；重复下载复用记录，应用中的新路径则替换旧副本。"""
+        candidate_path = Path(candidate.path)
+        try:
+            fingerprint = wallpaper_digest(candidate)
+        except OSError:
+            self.items.append(candidate)
+            return candidate, True
+        existing = self._content_index.get(fingerprint)
+        if existing is None or not Path(existing.path).exists():
+            self.items.append(candidate)
+            self._content_index[fingerprint] = candidate
+            return candidate, True
+
+        existing.favorite = existing.favorite or candidate.favorite
+        if prefer_candidate_path and not same_windows_path(Path(existing.path), candidate_path):
+            previous_path = Path(existing.path)
+            existing.path = candidate.path
+            existing.title = candidate.title or existing.title
+            existing.source = candidate.source or existing.source
+            existing.content_hash = candidate.content_hash
+            existing.content_size = candidate.content_size
+            existing.content_mtime_ns = candidate.content_mtime_ns
+            cleanup_redundant_wallpaper_files(
+                [previous_path],
+                [Path(item.path) for item in self.items],
+                candidate_path,
+            )
+        elif not same_windows_path(Path(existing.path), candidate_path):
+            cleanup_redundant_wallpaper_files(
+                [candidate_path],
+                [Path(item.path) for item in self.items],
+            )
+        return existing, False
+
     def image_for(self, path: Path, size: tuple[int, int]) -> ImageTk.PhotoImage:
         try:
             with Image.open(path) as raw:
@@ -2057,10 +2275,12 @@ class App:
         self.local_page = 0
         self.refresh()
 
-    def add_file(self, source: Path, source_name: str = "本地导入") -> None:
+    def add_file(self, source: Path, source_name: str = "本地导入") -> tuple[Wallpaper, bool]:
         if source.suffix.lower() not in IMAGE_EXTENSIONS: raise ValueError("只接受 BMP、JPG、JPEG、PNG 静态图片")
         target = WALLPAPER_DIR / f"{uuid.uuid4().hex}{source.suffix.lower()}"; shutil.copy2(source, target)
-        self.items.append(Wallpaper(uuid.uuid4().hex, str(target), source.stem, source=source_name))
+        return self._add_or_merge_wallpaper(
+            Wallpaper(uuid.uuid4().hex, str(target), source.stem, source=source_name)
+        )
 
     def import_yuanqi_cache_roots(self, roots: list[Path]) -> None:
         self.cache_status.configure(text="正在扫描并复制，请稍候……")
@@ -2080,12 +2300,17 @@ class App:
                 self.cache_status.configure(text="迁移失败")
                 messagebox.showerror("迁移失败", str(error))
                 return
-            self.items.extend(imported)
-            if imported:
-                self.selected_id = imported[0].id
+            added_items: list[Wallpaper] = []
+            selected: Wallpaper | None = None
+            for candidate in imported:
+                selected, added = self._add_or_merge_wallpaper(candidate)
+                if added:
+                    added_items.append(selected)
+            if selected:
+                self.selected_id = selected.id
             self.refresh()
-            self.cache_status.configure(text=f"发现 {len(candidates)} 张有效静态图，本次新增 {len(imported)} 张")
-            self.status.set(f"已把 {len(imported)} 张元气静态缓存独立复制到本地资料库。")
+            self.cache_status.configure(text=f"发现 {len(candidates)} 张有效静态图，本次新增 {len(added_items)} 张")
+            self.status.set(f"已把 {len(added_items)} 张元气静态缓存独立复制到本地资料库。")
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2101,8 +2326,14 @@ class App:
         paths = filedialog.askopenfilenames(title="选择静态壁纸", filetypes=[("图片", "*.bmp *.jpg *.jpeg *.png")])
         if not paths: return
         try:
-            for raw in paths: self.add_file(Path(raw))
-            self.selected_id = self.items[-1].id; self.refresh(); self.status.set(f"已导入 {len(paths)} 张图片。")
+            added = 0
+            selected: Wallpaper | None = None
+            for raw in paths:
+                selected, is_new = self.add_file(Path(raw))
+                added += int(is_new)
+            if selected:
+                self.selected_id = selected.id
+            self.refresh(); self.status.set(f"已导入 {added} 张新图片，跳过 {len(paths) - added} 张重复图片。")
         except (OSError, ValueError) as exc: messagebox.showerror("导入失败", str(exc))
 
     def sync_official_featured(self) -> None:
@@ -2110,7 +2341,9 @@ class App:
         try:
             for title, url in OFFICIAL_FEATURED:
                 if (title, OFFICIAL_FEATURED_SOURCE) not in existing:
-                    self.items.append(download_static_image(url, title, OFFICIAL_FEATURED_SOURCE)); added += 1
+                    _wallpaper, is_new = self._add_or_merge_wallpaper(
+                        download_static_image(url, title, OFFICIAL_FEATURED_SOURCE)
+                    ); added += int(is_new)
             if self.items: self.selected_id = self.items[-1].id
             self.refresh(); self.status.set("5 张官网公开样图已是最新。" if not added else f"已同步 {added} 张官网公开样图；这不代表账号资源已接入。")
         except (OSError, ValueError) as exc: messagebox.showerror("同步失败", str(exc))
@@ -2156,8 +2389,8 @@ class App:
         value = tk.StringVar(); tk.Entry(dialog, textvariable=value, width=70, relief="solid", bd=1).pack(padx=22, pady=6)
         def run() -> None:
             try:
-                url = value.get().strip(); self.items.append(download_static_image(url, Path(urllib.parse.urlparse(url).path).stem or "下载壁纸", "授权直链"))
-                self.selected_id = self.items[-1].id; self.refresh(); self.status.set("下载完成，已加入图库。"); dialog.destroy()
+                url = value.get().strip(); wallpaper, added = self._add_or_merge_wallpaper(download_static_image(url, Path(urllib.parse.urlparse(url).path).stem or "下载壁纸", "授权直链"))
+                self.selected_id = wallpaper.id; self.refresh(); self.status.set("下载完成，已加入图库。" if added else "图库已有相同图片，未重复添加。"); dialog.destroy()
             except (OSError, ValueError) as exc: messagebox.showerror("下载失败", str(exc), parent=dialog)
         self.button(dialog, "下载并加入图库", run, accent=True).pack(pady=14)
 
