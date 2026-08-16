@@ -155,11 +155,21 @@ open("clean.mp4", "wb").write(
 
 ---
 
+## CWP3 解包：算法已定位，密钥仍待确认
+
+并行逆向结论（cfwpen.dll = cmwallpaperengine，Botan 2.13 + 自定义 AES）：
+
+- CWP 是 `"CWP\x02/03"` 16 字节头 + **全加密体**（清单、块头、数据全部加密，熵 8.0）。
+- 解密：`0x1025ca60`（crypto 构建器）→ `0x10272640`（PBKDF2-like，**1000 迭代**，salt 长 = `mode*4+4`，输出 = `mode*16+0x12`）→ `0x10271480`（AES key schedule，keylen = `mode*8+8`，mode1=AES-128/mode2=AES-192）→ `0x1025ca00`（逐 32KB AES 解密）。
+- 源密钥（KDF password）是引擎对象成员（`[obj-0x2c]`），**运行时由 loader 写入**，cfwpen.dll 内无静态立即数。最强候选口令：`"&g3P8&uC"`（cfwthmim.dll 显式用它作 CWP 资源解密口令）、`"123"`、`"519000"`。但用这些口令 + PBKDF2-HMAC-SHA1 + 头部 salt 测试，**均未能解出 CWP 体**——说明 KDF 的具体哈希/盐/迭代细节与标准 PBKDF2 仍有差异，或口令另有其源。
+- 完整解包仍需：精确的 KDF 实现 + 源密钥确认（静态追踪 loader 写入口令，或动态在播放器启动瞬间 hook `0x10272640` dump password/salt）。
+
+**当前代码行为**：正式源如果是 CWP 容器，不再按 XOR-MP4 解出乱码，而是明确报"CWP 场景容器尚未实现解包"；**不回退**带 HUD 的 preview_video，因此不会再生成 1536×864 假时钟图。动态转静态的干净高清源仍走已可用的 `video`/`video_4k` XOR-MP4 路径（非 scene 动态主题）。
+
 ## 边界与安全说明
 
 - 本解密只用于**把用户本人通过正规渠道下载的壁纸**转换为 Windows 原生静态图片
   （个人格式互转），不涉及服务端访问控制、会员权限、设备绑定或会话秘密。
 - 密钥是本机官方二进制中的固定混淆串，不属于账号/设备/会话秘密；代码不读取、
   不落盘官方客户端的 Cookie、令牌或会员凭据。
-- 只处理 `video`/`video_4k` 等标准 MP4 混淆源；不逆向、不解析 CWP 私有封装，
-  也不绕过登录/授权。
+- 只处理 `video`/`video_4k` 等标准 MP4 混淆源；CWP3 解包仍在研究中，不绕过登录/授权。

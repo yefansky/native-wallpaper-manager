@@ -671,7 +671,9 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
         return bool(item.source_video_url)
 
     def _preview_fallback_allowed(self, item: CatalogItem) -> bool:
-        return True
+        # 有正式源视频时，若解码失败（可能是 CWP3 私有容器）不能回退 preview_video，
+        # 否则会把时间/天气 HUD 烘焙成不会更新的固定假时钟。
+        return not bool(item.source_video_url)
 
     def download_original(self, item_id: str) -> bytes:
         item = self._items_by_id.get(str(item_id))

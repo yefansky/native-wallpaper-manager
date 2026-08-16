@@ -252,6 +252,9 @@ def _download_preview(url: str, path: Path, http: object, *, decrypt: bool = Fal
                 size += len(chunk)
                 if size > MAX_PREVIEW_VIDEO_BYTES:
                     raise ConversionUnavailable("预览视频超过 96 MiB 安全上限")
+                if decrypt and offset == 0 and chunk[:4] in (b"CWP\x02", b"CWP\x03"):
+                    # 正式源是 CWP 私有容器，不是 XOR 混淆的 MP4；不要解出乱码。
+                    raise ConversionUnavailable("正式源是 CWP 场景容器，当前版本尚未实现 CWP3 解包")
                 output.write(decrypt_video_bytes(chunk, offset) if decrypt else chunk)
         if size == 0:
             raise ConversionUnavailable("预览视频为空")

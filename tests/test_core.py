@@ -358,6 +358,29 @@ class CoreTests(unittest.TestCase):
                 "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/protected.mp4"
             )
 
+    def test_cwp3_source_raises_instead_of_xor_garbage(self):
+        # CWP 容器源不能被当作 XOR-MP4 解出乱码；应明确拒绝，避免假时钟。
+        from dynamic_converter import ConversionUnavailable, convert_preview_video_to_jpeg
+
+        class FakeHttp:
+            def get(self, url, timeout, stream=False, **kwargs):
+                class Resp:
+                    headers = {"Content-Type": "application/octet-stream"}
+                    def raise_for_status(self):
+                        return None
+                    def iter_content(self, _n):
+                        yield b"CWP\x03" + b"\x00" * 64
+                return Resp()
+
+        with self.assertRaises(ConversionUnavailable) as ctx:
+            convert_preview_video_to_jpeg(
+                "https://img-baofun.zhhainiao.com/scene/x.cwp",
+                http=FakeHttp(),
+                tool_finder=lambda: ("ffmpeg.exe", "ffprobe.exe"),  # 不会真的被调用
+                decrypt=True,
+            )
+        self.assertIn("CWP", str(ctx.exception))
+
     def test_only_dynamic_scene_items_receive_baked_component_warning(self):
         scene = CatalogItem("1", "场景", "https://example.test/scene.jpg", resource_kind="dynamic", format="scene")
         video = CatalogItem("2", "视频", "https://example.test/video.jpg", resource_kind="dynamic", format="MP4")
@@ -1098,7 +1121,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(item.preview_url.endswith("frame.jpg"))
         self.assertTrue(item.preview_video_url.endswith("frame_preview.mp4"))
 
-    def test_dynamic_source_failure_falls_back_to_preview_video(self):
+    def test_dynamic_source_failure_does_not_fall_back_to_preview_video(self):
         converted = ConvertedFrame(b"preview-jpeg", 1920, 1080, 3.3, 100.0, 5)
         converter = unittest.mock.Mock(side_effect=[ConversionUnavailable("not mp4"), converted])
         source = YuanqiDynamicResourceSource(
@@ -1112,9 +1135,11 @@ class CoreTests(unittest.TestCase):
         )
         source._items_by_id[item.id] = item
 
-        self.assertEqual(source.download_original(item.id), b"preview-jpeg")
-        self.assertEqual(len(converter.call_args_list), 2)
-        self.assertTrue(source.conversion_summary(item.id).startswith("预览回退 · "))
+        # 源视频解码失败（可能是 CWP3 私有容器）时，不能回退带 HUD 的 preview_video。
+        from catalog import CatalogError
+        with self.assertRaises(CatalogError):
+            source.download_original(item.id)
+        self.assertEqual(len(converter.call_args_list), 1)
 
     def test_dynamic_global_search_uses_official_endpoint(self):
         source = YuanqiDynamicResourceSource(
