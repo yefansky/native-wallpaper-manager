@@ -1,28 +1,43 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
-rem 定位 Python（pythonw 与 python 同目录）
-set "PYDIR="
-for /f "delims=" %%i in ('where python 2^>nul') do if not defined PYDIR set "PYDIR=%%~dpi"
-if not defined PYDIR (
-    echo [桌面画廊] 未找到 Python，请先安装 Python 3.10+ 并勾选 "Add python.exe to PATH"。
+call :find_python
+if errorlevel 1 (
+    echo [Desktop Gallery] Python 3.10 or newer was not found.
+    echo Install Python and enable "Add python.exe to PATH", then try again.
     pause
     exit /b 1
 )
 
-rem 首次运行自动安装依赖
-"%PYDIR%python.exe" -c "import PIL, requests, webview, pystray" >nul 2>nul
+"%PYTHON_EXE%" -c "import PIL, requests, webview, pystray" >nul 2>nul
 if errorlevel 1 (
-    echo [桌面画廊] 首次运行，正在安装依赖，请稍候...
-    "%PYDIR%python.exe" -m pip install -r requirements.txt
+    echo [Desktop Gallery] Installing required Python packages...
+    "%PYTHON_EXE%" -m pip install -r "%~dp0requirements.txt"
     if errorlevel 1 (
-        echo [桌面画廊] 依赖安装失败，请检查网络后重试。
+        echo [Desktop Gallery] Package installation failed.
         pause
         exit /b 1
     )
 )
 
-rem 用 pythonw 启动（无控制台窗口）；start 让本窗口立即返回
-start "" "%PYDIR%pythonw.exe" "%~dp0app\native_wallpaper.py"
-endlocal
+for %%I in ("%PYTHON_EXE%") do set "PYTHONW_EXE=%%~dpIpythonw.exe"
+if exist "%PYTHONW_EXE%" (
+    start "" "%PYTHONW_EXE%" "%~dp0app\native_wallpaper.py"
+) else (
+    start "Desktop Gallery" "%PYTHON_EXE%" "%~dp0app\native_wallpaper.py"
+)
+exit /b 0
+
+:find_python
+set "PYTHON_EXE="
+for /f "delims=" %%I in ('where.exe python 2^>nul') do call :try_python "%%I"
+if not defined PYTHON_EXE for /f "usebackq delims=" %%I in (`py -3 -c "import sys; print(sys.executable)" 2^>nul`) do call :try_python "%%I"
+if not defined PYTHON_EXE exit /b 1
+exit /b 0
+
+:try_python
+if defined PYTHON_EXE exit /b 0
+"%~1" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+if not errorlevel 1 set "PYTHON_EXE=%~1"
+exit /b 0
