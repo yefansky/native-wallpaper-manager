@@ -8,7 +8,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
-from catalog import IntegrationUnavailable, YuanqiOfficialApiSource
+from catalog import CatalogError, IntegrationUnavailable, YuanqiOfficialApiSource, YuanqiResourceSource
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -273,6 +273,37 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn(symbol, source)
         self.assertIn("SystemParametersInfoW", source)
 
+
+    def test_resource_source_lists_items_with_session(self):
+        def session(): return {"uid": "open-1", "token": "tok-1", "provider": "wechat"}
+        def device(): return {"deviceId": "dev-1"}
+        source = YuanqiResourceSource(session, device)
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0},
+                "data": {"list": [{"id": "491857", "wname": "测试壁纸", "cid": 1, "cname": "风景",
+                                   "author": "作者", "jpg_url": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/static/1.jpg",
+                                   "md5": "d41d8cd98f00b204e9800998ecf8427e"}], "total": 100},
+            }
+            page = source.list_items("1", 1)
+        self.assertEqual(len(page.items), 1)
+        item = page.items[0]
+        self.assertEqual(item.id, "491857")
+        self.assertEqual(item.title, "测试壁纸")
+        self.assertEqual(item.category_name, "风景")
+        self.assertTrue(item.original_url.endswith(".jpg"))
+
+    def test_resource_source_rejects_bad_image_host(self):
+        def session(): return {"uid": "open-1", "token": "tok-1"}
+        def device(): return {"deviceId": "dev-1"}
+        source = YuanqiResourceSource(session, device)
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0},
+                "data": {"list": [{"id": "1", "wname": "x", "jpg_url": "https://evil.example/a.jpg"}]},
+            }
+            with self.assertRaises(CatalogError):
+                source.list_items("0", 1)
 
     def test_config_round_trip(self):
         original = app.CONFIG_PATH

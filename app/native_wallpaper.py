@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -22,7 +23,7 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageOps, ImageTk
 
-from catalog import YuanqiOfficialApiSource
+from catalog import CatalogError, CatalogItem, IntegrationUnavailable, YuanqiResourceSource
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -253,9 +254,19 @@ class App:
         self.root.minsize(1000, 640)
         self.root.configure(bg=BG)
         self.config = load_config()
-        self.yuanqi_source = YuanqiOfficialApiSource()
         self.wechat_backend = WechatQrLoginBackend()
         self.yuanqi_auth = YuanqiAuthCoordinator(self.wechat_backend)
+        self.yuanqi_source = YuanqiResourceSource(
+            session_provider=self._wechat_session_provider,
+            device_provider=self._wechat_device_provider,
+        )
+        self.online_photo_refs: list[ImageTk.PhotoImage] = []
+        self.online_items: list[CatalogItem] = []
+        self.online_selected_id: str | None = None
+        self.online_cate_id = "0"
+        self.online_page = 1
+        self.online_has_more = False
+        self.online_total = 0
         self.items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
         self.filter_favorites = False
         self.local_page = 0
@@ -344,6 +355,9 @@ class App:
             button.configure(bg=GOLD if key == name else "#f1f3f7")
         if name == "theme": self.refresh_theme_preview()
         if name == "mine": self.refresh_mine_summary()
+        if name == "official":
+            self.login_status.configure(text=self._login_status_text())
+            self.load_online_items(self.online_cate_id, self.online_page)
 
     def page_header(self, page: tk.Frame, title: str, description: str) -> None:
         tk.Label(page, text=title, bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 21, "bold")).pack(anchor="w", pady=(6, 2))
@@ -369,98 +383,227 @@ class App:
         self.native_card(actions, "应用当前主题", "交给 Windows 个性化机制应用；仅改变主题和壁纸，不创建桌面层。", "用 Windows 应用", self.apply_native_theme).pack(fill="x")
         return page
 
+
+    def _wechat_session_provider(self):
+        try:
+            return self.wechat_backend.get_user_info()
+        except RuntimeError:
+            return {}
+
+    def _wechat_device_provider(self):
+        try:
+            return self.wechat_backend.get_device_info()
+        except RuntimeError:
+            return {}
+
     def build_official_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG)
-        capabilities = self.yuanqi_source.capabilities()
-        self.page_header(page, "元气资源", "这里仅显示真正可执行的动作；不再用不可点击的分类标签冒充功能。")
-        notice = tk.Frame(page, bg="#fff7df", highlightbackground="#f1d28a", highlightthickness=1, padx=14, pady=9)
-        notice.pack(fill="x", pady=(0, 10))
-        tk.Label(notice, text=f"联网账号未接通：{capabilities.reason}", bg="#fff7df", fg=PINK,
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-        tk.Label(notice, text="官方元气客户端已经登录 ≠ 本客户端已经登录", bg="#fff7df", fg=TEXT,
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", pady=(4, 0))
+        self.page_header(page, "元气资源", "登录后可浏览、下载并应用元气桌面联网壁纸。")
 
-        content = tk.Frame(page, bg=BG)
-        content.pack(fill="both", expand=True, pady=(8, 0))
-        migrate = tk.Frame(content, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=26, pady=24)
-        migrate.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        tk.Label(migrate, text="迁移本机已有元气静态壁纸", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
-        tk.Label(migrate, text="扫描元气已经下载到本机的静态图片，验证图片有效性并复制进桌面画廊自己的目录。复制完成后不依赖官方客户端。",
-                 bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 10), pady=10).pack(anchor="w")
-        migrated_count = sum(item.source == YUANQI_CACHE_SOURCE for item in self.items)
-        cache_text = f"本地资料库已有 {migrated_count} 张迁移图片" if migrated_count else "尚未扫描"
-        self.cache_status = tk.Label(migrate, text=cache_text, bg=PANEL, fg=PINK, font=("Microsoft YaHei UI", 10, "bold"))
-        self.cache_status.pack(anchor="w", pady=(4, 16))
-        migrate_actions = tk.Frame(migrate, bg=PANEL); migrate_actions.pack(anchor="w")
-        self.button(migrate_actions, "扫描并迁移", self.import_detected_yuanqi_cache, accent=True).pack(side="left", padx=(0, 8))
-        self.button(migrate_actions, "选择其他缓存目录", self.choose_yuanqi_cache_directory).pack(side="left")
+        status_bar = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=16, pady=10)
+        status_bar.pack(fill="x", pady=(0, 8))
+        self.login_status = tk.Label(status_bar, text=self._login_status_text(), bg=PANEL, fg=PINK,
+                                     font=("Microsoft YaHei UI", 10, "bold"))
+        self.login_status.pack(side="left")
+        status_actions = tk.Frame(status_bar, bg=PANEL); status_actions.pack(side="right")
+        self.button(status_actions, "微信扫码登录", self.start_wechat_login, accent=True).pack(side="left", padx=(0, 6))
+        self.logout_button = self.button(status_actions, "退出登录", self.logout_wechat)
+        self.logout_button.pack(side="left", padx=(0, 6))
+        self.logout_button.configure(state="disabled" if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED else "normal")
 
-        online = tk.Frame(content, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=26, pady=24)
-        online.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        tk.Label(online, text="电脑版登录宿主", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
-        tk.Label(online, text="已接入官方公开登录页：由本客户端拉起微信扫码，页面用 code 换会话并经资源服务校验。",
-                 bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 10), pady=10).pack(anchor="w")
-        self.login_status = tk.Label(online, text=f"当前状态：{self.yuanqi_auth.snapshot.message}", bg=PANEL, fg=PINK,
-                                     justify="left", wraplength=500, font=("Microsoft YaHei UI", 10, "bold"))
-        self.login_status.pack(anchor="w")
-        tk.Label(online, text="扫码、确认由你本人完成；本客户端只读取内存中的新会话，不读官方客户端令牌。",
-                 bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w")
-        online_actions = tk.Frame(online, bg=PANEL); online_actions.pack(anchor="w", pady=(10, 0))
-        self.button(online_actions, "微信扫码登录", self.start_wechat_login, accent=True).pack(side="left", padx=(0, 8))
-        self.button(online_actions, "查看桥接自检", self.show_yuanqi_auth_status).pack(side="left", padx=(0, 8))
-        self.button(online_actions, "在浏览器核验官网", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL)).pack(side="left")
-        self.browse_online_button = self.button(online_actions, "联网浏览壁纸", self.browse_online_wallpapers)
-        self.browse_online_button.pack(side="left", padx=(0, 8))
-        self.browse_online_button.configure(state="disabled" if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED else "normal")
+        cate_bar = tk.Frame(page, bg=BG); cate_bar.pack(fill="x", pady=(0, 6))
+        self.online_cate_buttons: dict[str, tk.Button] = {}
+        for cat in self.yuanqi_source.list_categories():
+            button = self.button(cate_bar, cat.title, lambda c=cat.id: self.load_online_items(c, 1))
+            button.pack(side="left", padx=2, pady=2)
+            self.online_cate_buttons[cat.id] = button
+
+        body = tk.Frame(page, bg=BG); body.pack(fill="both", expand=True)
+        grid_pane = tk.Frame(body, bg=BG); grid_pane.pack(side="left", fill="both", expand=True)
+        top = tk.Frame(grid_pane, bg=BG); top.pack(fill="x", pady=(0, 6))
+        self.online_page_label = tk.Label(top, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9))
+        self.online_page_label.pack(side="left")
+        self.button(top, "下一页", lambda: self.load_online_items(self.online_cate_id, self.online_page + 1)).pack(side="right", padx=2)
+        self.button(top, "上一页", lambda: self.load_online_items(self.online_cate_id, max(1, self.online_page - 1))).pack(side="right", padx=2)
+
+        self.online_canvas = tk.Canvas(grid_pane, bg=BG, highlightthickness=0)
+        online_scroll = tk.Scrollbar(grid_pane, orient="vertical", command=self.online_canvas.yview)
+        self.online_canvas.configure(yscrollcommand=online_scroll.set)
+        online_scroll.pack(side="right", fill="y"); self.online_canvas.pack(fill="both", expand=True)
+        self.online_grid = tk.Frame(self.online_canvas, bg=BG)
+        self.online_grid_window = self.online_canvas.create_window((0, 0), window=self.online_grid, anchor="nw")
+        self.online_grid.bind("<Configure>", lambda _event: self.online_canvas.configure(scrollregion=self.online_canvas.bbox("all")))
+        self.online_canvas.bind("<Configure>", lambda event: self.online_canvas.itemconfigure(self.online_grid_window, width=event.width))
+
+        preview = tk.Frame(body, bg=PANEL, width=300); preview.pack(side="right", fill="y", padx=(12, 0)); preview.pack_propagate(False)
+        self.online_preview_image = tk.Label(preview, bg="#d8dce6"); self.online_preview_image.pack(fill="both", expand=True, padx=14, pady=14)
+        self.online_preview_title = tk.Label(preview, text="选择一张壁纸", bg=PANEL, fg=TEXT, wraplength=260, font=("Microsoft YaHei UI", 14, "bold"))
+        self.online_preview_title.pack(anchor="w", padx=14)
+        self.online_preview_meta = tk.Label(preview, text="", bg=PANEL, fg=MUTED, wraplength=260, justify="left", font=("Microsoft YaHei UI", 9))
+        self.online_preview_meta.pack(anchor="w", padx=14, pady=4)
+        self.button(preview, "下载到本地图库", self.download_online_selected, accent=True).pack(anchor="w", padx=14, pady=(12, 5))
+        self.button(preview, "下载并应用为壁纸", self.apply_online_selected).pack(anchor="w", padx=14)
+
+        self.load_online_items("0", 1)
         return page
 
-    def browse_online_wallpapers(self) -> None:
-        """用会话访问联网壁纸资源；ret==0 且返回真实列表即资源访问成功。"""
+    def _login_status_text(self) -> str:
+        if self.yuanqi_auth.snapshot.phase == AuthPhase.AUTHENTICATED:
+            return "账号状态：已登录（微信扫码会话经资源服务校验通过）"
+        return "账号状态：未登录（请点击“微信扫码登录”）"
+
+    def logout_wechat(self) -> None:
+        self.wechat_backend.clear()
+        self.yuanqi_auth.clear()
+        self.online_selected_id = None
+        self.login_status.configure(text=self._login_status_text())
+        self.logout_button.configure(state="disabled")
+        self.load_online_items("0", 1)
+        self.status.set("已退出本客户端登录态；官方客户端登录不受影响。")
+
+    def load_online_items(self, cate_id: str, page: int) -> None:
+        self.online_cate_id = cate_id
+        self.online_page = page
+        for cid, button in self.online_cate_buttons.items():
+            button.configure(bg="#fff3cf" if cid == cate_id else "#f1f3f8")
+        self.online_photo_refs.clear()
+        self.online_items = []
+        self.online_selected_id = None
+        self.online_preview_title.configure(text="选择一张壁纸")
+        self.online_preview_meta.configure(text="")
+        self.online_preview_image.configure(image="")
+        for child in self.online_grid.winfo_children():
+            child.destroy()
         if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED:
-            messagebox.showinfo("需要登录", "请先微信扫码登录。")
+            self.online_page_label.configure(text="")
+            tk.Label(self.online_grid, text="尚未登录。请先点击“微信扫码登录”。", bg=BG, fg=MUTED,
+                     font=("Microsoft YaHei UI", 12)).pack(pady=44)
             return
-        session = self.wechat_backend.get_user_info()
-        device_id = self.wechat_backend.get_device_info()["deviceId"]
-        body = {
-            "login_info": {},
-            "common": {
-                "platform": "pc",
-                "open_id": session["uid"],
-                "token": session["token"],
-                "device_id": device_id,
-                "player_version": 1,
-            },
-            "page": 1,
-            "page_size": 4,
-            "cate_id": 0,
-            "tag_id": 0,
-            "sort_type": 1,
-        }
-        self.status.set("正在访问联网壁纸资源……")
+        self.status.set(f"正在加载联网壁纸（{cate_id or '精选'}）……")
         try:
-            response = requests.post("https://pcwallpaper.zhhainiao.com/wallpaper/static/list", json=body, timeout=15)
-            payload = response.json()
-            ret = payload.get("resp_common", {}).get("ret")
-            items = (payload.get("data") or {}).get("list") or []
-        except (OSError, ValueError) as exc:
-            self.status.set(f"联网资源访问失败：{exc}")
-            messagebox.showerror("联网资源失败", str(exc))
+            result = self.yuanqi_source.list_items(cate_id, page)
+        except (IntegrationUnavailable, CatalogError) as exc:
+            self.online_page_label.configure(text="")
+            tk.Label(self.online_grid, text=str(exc), bg=BG, fg=PINK,
+                     wraplength=460, justify="left", font=("Microsoft YaHei UI", 11)).pack(pady=44)
+            self.status.set(f"联网壁纸加载失败：{exc}")
             return
-        if ret != 0:
-            self.status.set(f"联网资源拒绝访问：ret={ret}")
-            messagebox.showwarning("联网资源", f"服务端返回 ret={ret}，未取得资源。")
+        self.online_items = list(result.items)
+        self.online_has_more = result.has_more
+        self.online_total = result.total
+        self.online_page_label.configure(text=f"第 {page} 页 · 共 {result.total or '?'} 条")
+        self._render_online_grid()
+        self.online_canvas.yview_moveto(0)
+        if self.online_items:
+            self.select_online(self.online_items[0])
+        self.status.set(f"联网壁纸已加载：第 {page} 页，{len(self.online_items)} 条。")
+
+    def _render_online_grid(self) -> None:
+        for child in self.online_grid.winfo_children():
+            child.destroy()
+        for index, item in enumerate(self.online_items):
+            selected = item.id == self.online_selected_id
+            card = tk.Frame(self.online_grid, bg=PANEL, highlightbackground=GOLD if selected else LINE,
+                            highlightthickness=2 if selected else 1, cursor="hand2")
+            card.grid(row=index // 3, column=index % 3, padx=6, pady=6, sticky="nsew")
+            self.online_grid.grid_columnconfigure(index % 3, weight=1)
+            photo = self.online_thumbnail_for(item, (200, 120)); self.online_photo_refs.append(photo)
+            picture = tk.Label(card, image=photo, bg=PANEL, cursor="hand2"); picture.pack(fill="x", padx=6, pady=(6, 4))
+            name = tk.Label(card, text=item.title, bg=PANEL, fg=TEXT, anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+            name.pack(fill="x", padx=8)
+            meta = tk.Label(card, text=(item.category_name or "精选") + (" · " + item.author if item.author else ""),
+                            bg=PANEL, fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 8))
+            meta.pack(fill="x", padx=8, pady=(2, 6))
+            for widget in (card, picture, name, meta):
+                widget.bind("<Button-1>", lambda _event, current=item: self.select_online(current))
+
+    def online_thumbnail_for(self, item: CatalogItem, size: tuple[int, int]) -> ImageTk.PhotoImage:
+        try:
+            response = requests.get(item.preview_url, timeout=20)
+            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+        except (OSError, ValueError, requests.RequestException):
+            image = Image.new("RGB", size, "#d8dce6")
+        return ImageTk.PhotoImage(ImageOps.fit(image, size, Image.Resampling.LANCZOS))
+
+    def selected_online(self) -> CatalogItem | None:
+        return next((item for item in self.online_items if item.id == self.online_selected_id), None)
+
+    def select_online(self, item: CatalogItem) -> None:
+        self.online_selected_id = item.id
+        self._render_online_grid()
+        photo = self.online_thumbnail_for(item, (260, 150)); self.online_photo_refs.append(photo)
+        self.online_preview_image.configure(image=photo)
+        self.online_preview_title.configure(text=item.title)
+        meta = " · ".join(part for part in (item.category_name, item.author, item.resolution, item.format) if part)
+        self.online_preview_meta.configure(text=meta or "元气桌面联网壁纸")
+
+    def _online_save_target(self, item: CatalogItem) -> Path:
+        suffix = Path(item.original_url or "").suffix.lower()
+        if suffix not in IMAGE_EXTENSIONS:
+            suffix = ".jpg"
+        WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
+        return WALLPAPER_DIR / f"{uuid.uuid4().hex}{suffix}"
+
+    def download_online_selected(self) -> None:
+        item = self.selected_online()
+        if not item:
+            messagebox.showinfo("请选择壁纸", "请先在联网壁纸里点选一张。")
             return
-        total = (payload.get("data") or {}).get("total", len(items))
-        lines = []
-        for item in items[:4]:
-            name = str(item.get("wname") or item.get("title") or "")
-            url = str(item.get("jpg_url") or item.get("preview_jpg") or "")
-            lines.append(f"· {name[:30]}" + (f"\n  {url[:60]}" if url else ""))
-        self.status.set(f"联网资源访问成功：total={total}，本次取得 {len(items)} 条。")
-        messagebox.showinfo(
-            "联网资源访问成功",
-            f"已用会话访问 pcwallpaper.zhhainiao.com 壁纸资源，ret=0。\n\n本次取得（共 {total} 条）：\n" + "\n".join(lines),
-        )
+        self.status.set(f"正在下载：{item.title}")
+
+        def work() -> None:
+            try:
+                data = self.yuanqi_source.download_original(item.id)
+                target = self._online_save_target(item)
+                target.write_bytes(data)
+                wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source="元气联网下载")
+                self.root.after(0, lambda: self._finish_online_download(wallpaper, None))
+            except (CatalogError, OSError, ValueError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_online_download(None, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_online_download(self, wallpaper: Wallpaper | None, error: Exception | None) -> None:
+        if error:
+            self.status.set(f"下载失败：{error}")
+            messagebox.showerror("下载失败", str(error))
+            return
+        self.items.append(wallpaper)
+        self.selected_id = wallpaper.id
+        self.refresh()
+        self.status.set(f"已下载并加入本地图库：{wallpaper.title}")
+        messagebox.showinfo("下载成功", f"已把“{wallpaper.title}”下载到本地图库。可到“本地壁纸”页预览或应用。")
+
+    def apply_online_selected(self) -> None:
+        item = self.selected_online()
+        if not item:
+            messagebox.showinfo("请选择壁纸", "请先在联网壁纸里点选一张。")
+            return
+        self.status.set(f"正在下载并应用：{item.title}")
+
+        def work() -> None:
+            try:
+                data = self.yuanqi_source.download_original(item.id)
+                target = self._online_save_target(item)
+                target.write_bytes(data)
+                set_native_wallpaper(target)
+                wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source="元气联网下载")
+                self.root.after(0, lambda: self._finish_online_apply(wallpaper, None))
+            except (CatalogError, OSError, ValueError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_online_apply(None, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_online_apply(self, wallpaper: Wallpaper | None, error: Exception | None) -> None:
+        if error:
+            self.status.set(f"应用失败：{error}")
+            messagebox.showerror("应用失败", str(error))
+            return
+        self.items.append(wallpaper)
+        self.selected_id = wallpaper.id
+        self.refresh()
+        self.status.set(f"已应用为 Windows 原生壁纸：{wallpaper.title}")
+        messagebox.showinfo("应用成功", f"“{wallpaper.title}”已由 Windows 注册表复核应用成功。")
 
     def _launch_wechat_login_window(self) -> dict | None:
         """以独立子进程拉起微信登录窗，读取其 stdout 返回的会话结构。"""
@@ -519,9 +662,10 @@ class App:
             return
         log_diag("app 会话校验通过 AUTHENTICATED")
         self.status.set("微信登录成功：账号、设备与资源服务会话均已由服务端校验。")
-        self.login_status.configure(text=f"当前状态：{snapshot.message}")
-        self.browse_online_button.configure(state="normal")
-        messagebox.showinfo("登录成功", "已用微信扫码登录元气账号，并取得服务端可校验的会话。")
+        self.login_status.configure(text=self._login_status_text())
+        self.logout_button.configure(state="normal")
+        self.load_online_items("0", 1)
+        messagebox.showinfo("登录成功", "已用微信扫码登录元气账号。\n可浏览并下载联网壁纸。")
 
     def show_yuanqi_auth_status(self) -> None:
         methods = "\n".join(
@@ -724,7 +868,9 @@ class App:
 
     def refresh_mine_summary(self) -> None:
         favorites = sum(item.favorite for item in self.items)
-        self.mine_summary.configure(text=f"本地资料库\n\n{len(self.items)} 张静态壁纸\n{favorites} 张收藏\n\n元气账号\n本客户端尚未接入\n\n主题文件\n{self.theme_path()}\n\n资源全部存放在本机，不保存元气账号 Cookie 或令牌。")
+        online_downloaded = sum(item.source == "元气联网下载" for item in self.items)
+        account = "已登录（微信扫码会话）" if self.yuanqi_auth.snapshot.phase == AuthPhase.AUTHENTICATED else "未登录"
+        self.mine_summary.configure(text=f"本地资料库\n\n{len(self.items)} 张静态壁纸\n{favorites} 张收藏\n{online_downloaded} 张联网下载\n\n元气账号\n{account}\n\n主题文件\n{self.theme_path()}\n\n资源全部存放在本机，会话令牌只驻留内存，不保存元气 Cookie 或令牌。")
 
     def show_favorites(self) -> None:
         self.filter_favorites = True; self.local_page = 0; self.refresh()
