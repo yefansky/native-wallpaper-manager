@@ -10,7 +10,17 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
 import session_store as session_store
 from product import SingleInstance, autostart_command, autostart_enabled, set_autostart
-from catalog import CatalogError, CatalogItem, IntegrationUnavailable, YuanqiOfficialApiSource, YuanqiResourceSource
+from catalog import (
+    CatalogError,
+    CatalogItem,
+    CatalogPage,
+    IntegrationUnavailable,
+    YuanqiDynamicResourceSource,
+    YuanqiOfficialApiSource,
+    YuanqiResourceSource,
+    validate_resource_preview_video_url,
+)
+from dynamic_converter import ConvertedFrame, candidate_timestamps, frame_quality
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -250,6 +260,33 @@ class CoreTests(unittest.TestCase):
         # 元气静态页只把这两个入口写在前端；其余导航由 cate_nav_v2 返回。
         self.assertEqual(labels, ["关注", "精选"])
 
+    def test_dynamic_navigation_has_official_special_entries(self):
+        labels = [category.title for category in YuanqiDynamicResourceSource().list_categories()]
+        self.assertEqual(labels, ["关注", "精选", "最新"])
+
+    def test_dynamic_candidate_sampling_never_uses_first_frame(self):
+        points = candidate_timestamps(10.0)
+        self.assertEqual(len(points), 5)
+        self.assertGreater(points[0], 1.0)
+        self.assertLess(points[-1], 9.0)
+
+    def test_dynamic_frame_quality_prefers_sharp_picture(self):
+        from PIL import ImageFilter
+
+        sharp = Image.new("RGB", (1280, 720), "white")
+        for x in range(0, 1280, 16):
+            for y in range(0, 720, 16):
+                if (x // 16 + y // 16) % 2:
+                    sharp.paste("black", (x, y, x + 16, y + 16))
+        blurred = sharp.filter(ImageFilter.GaussianBlur(8))
+        self.assertGreater(frame_quality(sharp), frame_quality(blurred))
+
+    def test_dynamic_preview_rejects_full_video_path(self):
+        with self.assertRaises(CatalogError):
+            validate_resource_preview_video_url(
+                "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/protected.mp4"
+            )
+
     def test_unverified_synthetic_category_is_not_faked(self):
         source = YuanqiResourceSource(lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"})
         with self.assertRaises(CatalogError):
@@ -277,6 +314,57 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(window.online_query, "雨夜")
             self.assertEqual(window.local_query, "雨夜")
             load_online.assert_called_once_with("__featured__", 1, "雨夜")
+        finally:
+            root.destroy()
+
+    def test_app_switches_dynamic_navigation_without_changing_native_backend(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            self.assertEqual(
+                [button.cget("text") for button in window.online_mode_buttons.values()],
+                ["静态壁纸", "动态转静态"],
+            )
+            with patch.object(window, "load_online_items") as load_online:
+                window._switch_resource_mode("dynamic")
+            self.assertEqual(window.online_resource_mode, "dynamic")
+            self.assertEqual(
+                [button.cget("text") for button in window.online_cate_buttons.values()],
+                ["关注", "精选", "最新"],
+            )
+            load_online.assert_called_once_with("__featured__", 1)
+        finally:
+            root.destroy()
+
+    def test_global_online_search_merges_static_and_dynamic_results(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            static_item = CatalogItem("s1", "静态山景", "https://img-baofun.zhhainiao.com/s.jpg")
+            dynamic_item = CatalogItem(
+                "d1",
+                "动态山景",
+                "https://img-baofun.zhhainiao.com/d.jpg",
+                resource_kind="dynamic",
+                preview_video_url="https://img-baofun.zhhainiao.com/d_preview.mp4",
+            )
+            window.yuanqi_source = unittest.mock.Mock()
+            window.yuanqi_dynamic_source = unittest.mock.Mock()
+            window.yuanqi_source.refresh_categories.return_value = ()
+            window.yuanqi_source.search.return_value = CatalogPage((static_item,), 1, False, 10)
+            window.yuanqi_dynamic_source.search.return_value = CatalogPage((dynamic_item,), 1, True, 20)
+            captured = []
+            with patch.object(window, "_safe_after", side_effect=lambda callback: callback()), patch.object(
+                window, "_set_online_items", side_effect=captured.append
+            ):
+                window._fetch_online("__featured__", 1, "山景")
+            self.assertEqual([item.resource_kind for item in captured[0].items], ["static", "dynamic"])
+            self.assertEqual(captured[0].total, 30)
+            self.assertTrue(captured[0].has_more)
         finally:
             root.destroy()
 
@@ -420,6 +508,92 @@ class CoreTests(unittest.TestCase):
             source.list_items("tag:93", 1)
         body = mock_post.call_args.kwargs["json"]
         self.assertEqual((body["cate_id"], body["tag_id"], body["sort_type"]), (0, 93, 2))
+
+    def test_dynamic_categories_follow_live_server_order(self):
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}
+        )
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0},
+                "data": [
+                    {"tid": 21283, "tname": "互动"},
+                    {"tid": 109, "tname": "4k"},
+                    {"cid": 2, "cname": "风景"},
+                    {"cid": 24, "tname": "IP专区"},
+                ],
+            }
+            categories = source.refresh_categories()
+        self.assertTrue(mock_post.call_args.args[0].endswith("/wallpaper/live/cate_nav_v2"))
+        self.assertEqual(
+            [(item.id, item.title) for item in categories],
+            [
+                ("__following__", "关注"),
+                ("__featured__", "精选"),
+                ("__newest__", "最新"),
+                ("tag:21283", "互动"),
+                ("tag:109", "4k"),
+                ("cate:2", "风景"),
+                ("cate:24", "IP专区"),
+            ],
+        )
+
+    def test_dynamic_list_uses_preview_video_and_never_full_video(self):
+        converted = ConvertedFrame(b"jpeg-data", 1920, 1080, 3.3, 100.0, 5)
+        converter = unittest.mock.Mock(return_value=converted)
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"},
+            lambda: {"deviceId": "d"},
+            converter=converter,
+        )
+        raw = {
+            "wid": 730193,
+            "wname": "竹林下雨",
+            "preview_jpg_raw": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/frame.jpg",
+            "preview_video": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/preview/demo_preview.mp4",
+            "video": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/protected.mp4",
+            "resolution": "3840*2160",
+        }
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": {"list": [raw], "total": 1}
+            }
+            page = source.list_items("cate:2")
+        item = page.items[0]
+        self.assertEqual(item.resource_kind, "dynamic")
+        self.assertEqual(item.preview_video_url, raw["preview_video"])
+        self.assertNotEqual(item.preview_video_url, raw["video"])
+        self.assertEqual(source.download_original(item.id), b"jpeg-data")
+        converter.assert_called_once_with(raw["preview_video"], http=source._http)
+
+    def test_dynamic_global_search_uses_official_endpoint(self):
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}
+        )
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": {"list": [], "total": 0}
+            }
+            source.search("山野")
+        url = mock_post.call_args.args[0]
+        body = mock_post.call_args.kwargs["json"]
+        self.assertTrue(url.endswith("/v20526/wplive/opensearch/with/ptype"))
+        self.assertEqual(body["kw"], "山野")
+        self.assertEqual((body["page"], body["page_size"]), (1, 24))
+
+    def test_dynamic_following_does_not_repeat_server_collection_as_page_two(self):
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}
+        )
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": {"list": [], "total": 0}
+            }
+            first = source.list_items("__following__", 1)
+            second = source.list_items("__following__", 2)
+        self.assertFalse(first.has_more)
+        self.assertEqual(second.items, ())
+        self.assertEqual(mock_post.call_count, 1)
 
     def test_session_store_round_trip_encrypted(self):
         with tempfile.TemporaryDirectory() as temp:

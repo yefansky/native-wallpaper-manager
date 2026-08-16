@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import requests
 from PIL import Image
 
+from dynamic_converter import ConvertedFrame, ConversionUnavailable, convert_preview_video_to_jpeg
+
 
 CATALOG_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/list"
 INDEX_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/index"
@@ -22,6 +24,12 @@ SEARCH_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/search"
 CATEGORY_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/cate_nav_v2"
 FOLLOWING_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/static/following/list"
 SUGGEST_URL = "https://pcwallpaper.zhhainiao.com/v1/suggestion/suggest"
+DYNAMIC_LIST_URL = "https://pcwallpaper.zhhainiao.com/v20903/wplive/list"
+DYNAMIC_INDEX_URL = "https://pcwallpaper.zhhainiao.com/v20526/wplive/index"
+DYNAMIC_SEARCH_URL = "https://pcwallpaper.zhhainiao.com/v20526/wplive/opensearch/with/ptype"
+DYNAMIC_CATEGORY_URL = "https://pcwallpaper.zhhainiao.com/wallpaper/live/cate_nav_v2"
+DYNAMIC_FOLLOWING_URL = "https://pcwallpaper.zhhainiao.com/v1/wallpaper/live/following/list"
+DYNAMIC_NEWEST_URL = "https://pcwallpaper.zhhainiao.com/wplive/list/newest"
 PAGE_SIZE = 24
 SORT_HOT_DESC = 2
 SORT_TIME_DESC = 1
@@ -33,6 +41,7 @@ RESOURCE_IMAGE_HOSTS = {
     "wallpaper-static.cheetahfun.com",
 }
 _RESOURCE_IMAGE_HOST_SUFFIXES = (".baofun.zhhainiao.com", ".cheetahfun.com")
+_RESOURCE_VIDEO_HOST_SUFFIXES = _RESOURCE_IMAGE_HOST_SUFFIXES
 
 
 class IntegrationUnavailable(RuntimeError):
@@ -78,6 +87,8 @@ class CatalogItem:
     likes: int = 0
     views: int = 0
     price: int = 0
+    resource_kind: str = "static"
+    preview_video_url: str = ""
 
     @property
     def search_text(self) -> str:
@@ -114,6 +125,18 @@ def validate_resource_image_url(url: str) -> str:
         raise CatalogError("服务端返回了不受信任的图片地址")
     if not parsed.path or parsed.path == "/":
         raise CatalogError("服务端返回的图片地址缺少路径")
+    return url
+
+
+def validate_resource_preview_video_url(url: str) -> str:
+    """只接受元气图片 CDN 上公开、标准的 preview MP4。"""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    allowed = host in RESOURCE_IMAGE_HOSTS or host.endswith(_RESOURCE_VIDEO_HOST_SUFFIXES)
+    if parsed.scheme != "https" or not allowed:
+        raise CatalogError("服务端返回了不受信任的动态预览地址")
+    if not parsed.path.lower().endswith("_preview.mp4"):
+        raise CatalogError("动态资源没有标准 preview_video，拒绝读取完整视频或私有容器")
     return url
 
 
@@ -407,6 +430,177 @@ class YuanqiResourceSource:
         return data
 
 
+class YuanqiDynamicResourceSource(YuanqiResourceSource):
+    """元气动态目录适配器；只把标准 preview_video 转成静态 JPEG。"""
+
+    _SPECIAL_CATEGORIES = (
+        CatalogCategory("__following__", "关注"),
+        CatalogCategory("__featured__", "精选"),
+        CatalogCategory("__newest__", "最新"),
+    )
+
+    def __init__(self, *args, converter=convert_preview_video_to_jpeg, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._converter = converter
+        self._converted_by_id: dict[str, ConvertedFrame] = {}
+
+    def capabilities(self) -> SourceCapabilities:
+        configured = self._session_provider is not None and self._device_provider is not None
+        return SourceCapabilities(
+            source_name="元气动态预览转 Windows 静态壁纸",
+            authorization=configured,
+            categories=True,
+            paging=True,
+            search=True,
+            preview=True,
+            original_download=False,
+            reason="" if configured else "请先用本客户端完成微信扫码登录",
+        )
+
+    def refresh_categories(self) -> tuple[CatalogCategory, ...]:
+        """读取当前动态页导航，不在客户端硬编码官方分类。"""
+        if self._server_categories is not None:
+            return self.list_categories()
+        with self._category_lock:
+            if self._server_categories is not None:
+                return self.list_categories()
+            payload = self._post(DYNAMIC_CATEGORY_URL, {"common": self._common()})
+            raw_categories = payload.get("data") or []
+            if not isinstance(raw_categories, list):
+                raise CatalogError("动态分类导航结构错误")
+            categories: list[CatalogCategory] = []
+            seen: set[str] = set()
+            for raw in raw_categories:
+                if not isinstance(raw, Mapping):
+                    continue
+                if raw.get("tid") is not None:
+                    category_id = f"tag:{int(raw['tid'])}"
+                elif raw.get("cid") is not None:
+                    category_id = f"cate:{int(raw['cid'])}"
+                else:
+                    continue
+                title = str(raw.get("tname") or raw.get("cname") or "").strip()
+                if title and category_id not in seen:
+                    seen.add(category_id)
+                    categories.append(CatalogCategory(category_id, title))
+            self._server_categories = tuple(categories)
+            return self.list_categories()
+
+    @staticmethod
+    def _parse_item(raw: Mapping[str, object]) -> CatalogItem:
+        tags_raw = raw.get("tags") or []
+        tags = tuple(
+            str(tag.get("tname") or "")
+            for tag in tags_raw
+            if isinstance(tag, Mapping) and tag.get("tname")
+        )
+        preview = str(raw.get("preview_jpg_raw") or raw.get("preview_jpg_mid") or raw.get("preview_jpg") or "")
+        preview_video = str(raw.get("preview_video") or "")
+        if preview:
+            validate_resource_image_url(preview)
+        if preview_video:
+            validate_resource_preview_video_url(preview_video)
+        return CatalogItem(
+            id=str(raw.get("wid") or raw.get("id") or ""),
+            title=str(raw.get("wname") or raw.get("title") or "未命名动态壁纸"),
+            preview_url=preview,
+            original_url=preview or None,
+            category_id=str(raw.get("cate_id") or raw.get("cid") or ""),
+            category_name=str(raw.get("cname") or "动态转静态"),
+            author=str(raw.get("author_name") or raw.get("author") or ""),
+            tags=tags,
+            resolution=str(raw.get("resolution") or ""),
+            format=str(raw.get("format") or "动态预览 MP4"),
+            size_bytes=int(raw.get("size") or raw.get("storage") or 0),
+            likes=int(raw.get("likes") or 0),
+            views=int(raw.get("download_count") or raw.get("view") or 0),
+            price=int(raw.get("price") or raw.get("ptype") or 0),
+            resource_kind="dynamic",
+            preview_video_url=preview_video,
+        )
+
+    def _dynamic_body(self, page: int, page_size: int) -> dict[str, object]:
+        if page < 1:
+            raise ValueError("页码必须从 1 开始")
+        return {
+            "common": self._common(),
+            "resolution_support": 0,
+            "wtype_support": 1,
+            "encrypt_support": "none_encrypt",
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def _featured_page(self, page: int, page_size: int = PAGE_SIZE) -> CatalogPage:
+        body = self._dynamic_body(page, page_size)
+        body.pop("page")
+        body.pop("page_size")
+        body.update({"is_new_user": 0, "offset": (page - 1) * page_size, "count": page_size})
+        payload = self._post(DYNAMIC_INDEX_URL, body)
+        data = payload.get("data") or {}
+        if not isinstance(data, Mapping) or not isinstance(data.get("items"), list):
+            raise CatalogError("动态精选资源结构错误")
+        raw_items = data["items"]
+        items = tuple(self._parse_item(raw) for raw in raw_items if isinstance(raw, Mapping))
+        self._items_by_id.update({item.id: item for item in items if item.id})
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return CatalogPage(items, page, len(raw_items) >= page_size, total)
+
+    def _special_page(self, url: str, page: int, page_size: int = PAGE_SIZE) -> CatalogPage:
+        return self._page_from_list_payload(self._post(url, self._dynamic_body(page, page_size)), page)
+
+    def search(self, keyword: str, page: int = 1, page_size: int = PAGE_SIZE, progress_cb=None) -> CatalogPage:
+        keyword = keyword.strip()
+        if not keyword:
+            return CatalogPage((), page, False, 0)
+        body = self._dynamic_body(page, page_size)
+        body["kw"] = keyword
+        return self._page_from_list_payload(self._post(DYNAMIC_SEARCH_URL, body), page)
+
+    def list_items(self, category_id: str, page: int = 1, query: str = "") -> CatalogPage:
+        query = query.strip()
+        if query:
+            return self.search(query, page)
+        if category_id == "__following__":
+            # 当前关注接口一次返回完整集合且忽略 page；禁止把相同作品伪装成下一页。
+            if page > 1:
+                return CatalogPage((), page, False, 0)
+            result = self._special_page(DYNAMIC_FOLLOWING_URL, page)
+            return CatalogPage(result.items, page, False, len(result.items))
+        if category_id == "__newest__":
+            return self._special_page(DYNAMIC_NEWEST_URL, page)
+        if category_id in {"", "0", "__featured__"}:
+            return self._featured_page(page)
+        cate_id, tag_id = self._selector(category_id)
+        body = self._dynamic_body(page, PAGE_SIZE)
+        body.update({"cate_id": cate_id, "tag_id": tag_id, "sort_type": SORT_HOT_DESC})
+        return self._page_from_list_payload(self._post(DYNAMIC_LIST_URL, body), page)
+
+    def download_original(self, item_id: str) -> bytes:
+        item = self._items_by_id.get(str(item_id))
+        if item is None or not item.preview_video_url:
+            raise CatalogError("该资源没有标准 preview_video，无法安全转换")
+        url = validate_resource_preview_video_url(item.preview_video_url)
+        try:
+            converted = self._converter(url, http=self._http)
+        except ConversionUnavailable as exc:
+            raise CatalogError(str(exc)) from exc
+        self._converted_by_id[str(item_id)] = converted
+        return converted.jpeg
+
+    def conversion_summary(self, item_id: str) -> str:
+        converted = self._converted_by_id.get(str(item_id))
+        if converted is None:
+            return ""
+        return (
+            f"{converted.width}×{converted.height} · "
+            f"{converted.candidate_count} 点择优 · {converted.timestamp:g} 秒"
+        )
+
+
 class YuanqiOfficialApiSource:
     """兼容旧调用点：没有会话提供器时明确不可用。"""
 
@@ -422,7 +616,7 @@ class YuanqiOfficialApiSource:
         return "wechat_qr"
 
     def list_categories(self) -> tuple[CatalogCategory, ...]:
-        return YuanqiResourceSource._CATEGORIES
+        return YuanqiResourceSource._SPECIAL_CATEGORIES
 
     def list_items(self, category_id: str, page: int = 1, query: str = "") -> CatalogPage:
         return self._unavailable()

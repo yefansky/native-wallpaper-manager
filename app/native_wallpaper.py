@@ -25,7 +25,14 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 import pystray
 
-from catalog import CatalogError, CatalogItem, IntegrationUnavailable, YuanqiResourceSource
+from catalog import (
+    CatalogError,
+    CatalogItem,
+    CatalogPage,
+    IntegrationUnavailable,
+    YuanqiDynamicResourceSource,
+    YuanqiResourceSource,
+)
 from product import SingleInstance, autostart_enabled, set_autostart
 from yuanqi_auth import (
     AuthPhase,
@@ -274,6 +281,11 @@ class App:
             session_provider=self._wechat_session_provider,
             device_provider=self._wechat_device_provider,
         )
+        self.yuanqi_dynamic_source = YuanqiDynamicResourceSource(
+            session_provider=self._wechat_session_provider,
+            device_provider=self._wechat_device_provider,
+        )
+        self.online_resource_mode = "static"
         self.online_photo_refs: list[ImageTk.PhotoImage] = []
         self.online_items: list[CatalogItem] = []
         self.online_selected_id: str | None = None
@@ -282,7 +294,7 @@ class App:
         self.online_query = ""
         self.online_has_more = False
         self.online_total = 0
-        self._online_cache: dict[tuple[str, int, str], object] = {}
+        self._online_cache: dict[tuple[str, str, int, str], object] = {}
         self._thumb_cache: dict[str, bytes] = {}
         self._online_card_widgets: dict[str, tk.Frame] = {}
         self._loading_online = False
@@ -505,6 +517,33 @@ class App:
 
     def build_official_page(self) -> tk.Frame:
         page = tk.Frame(self.root, bg=BG)
+        mode_row = tk.Frame(page, bg=BG); mode_row.pack(fill="x", pady=(2, 4))
+        self.online_mode_buttons: dict[str, tk.Button] = {}
+        for mode, label in (("static", "静态壁纸"), ("dynamic", "动态转静态")):
+            button = tk.Button(
+                mode_row,
+                text=label,
+                command=lambda current=mode: self._switch_resource_mode(current),
+                relief="flat",
+                cursor="hand2",
+                bd=0,
+                bg=GOLD if mode == self.online_resource_mode else NAV_BG,
+                fg=TEXT,
+                activebackground=GOLD,
+                font=("Microsoft YaHei UI", 10, "bold"),
+                padx=15,
+                pady=7,
+            )
+            button.pack(side="left", padx=(0, 4))
+            self.online_mode_buttons[mode] = button
+        self.dynamic_mode_notice = tk.Label(
+            mode_row,
+            text="动态资源仅解码 preview_video，多点选帧后生成原生 JPEG；不接入 CWP/加密视频。",
+            bg=BG,
+            fg=MUTED,
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.dynamic_mode_notice.pack(side="left", padx=10)
         category_row = tk.Frame(page, bg=BG); category_row.pack(fill="x", pady=(2, 5))
         self.online_category_row = category_row
         self.online_cate_buttons: dict[str, tk.Button] = {}
@@ -538,8 +577,10 @@ class App:
         top = tk.Frame(grid_pane, bg=BG); top.pack(fill="x", pady=(0, 6))
         self.online_page_label = tk.Label(top, text="", bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9))
         self.online_page_label.pack(side="left")
-        self.button(top, "下一页", lambda: self.load_online_items(self.online_cate_id, self.online_page + 1, self.online_query), compact=True).pack(side="right", padx=2)
-        self.button(top, "上一页", lambda: self.load_online_items(self.online_cate_id, max(1, self.online_page - 1), self.online_query), compact=True).pack(side="right", padx=2)
+        self.online_next_button = self.button(top, "下一页", lambda: self.load_online_items(self.online_cate_id, self.online_page + 1, self.online_query), compact=True)
+        self.online_next_button.pack(side="right", padx=2)
+        self.online_previous_button = self.button(top, "上一页", lambda: self.load_online_items(self.online_cate_id, max(1, self.online_page - 1), self.online_query), compact=True)
+        self.online_previous_button.pack(side="right", padx=2)
 
         self.online_canvas = tk.Canvas(grid_pane, bg=BG, highlightthickness=0)
         online_scroll = tk.Scrollbar(grid_pane, orient="vertical", command=self.online_canvas.yview)
@@ -554,7 +595,7 @@ class App:
         return page
 
     def _render_online_categories(self, categories) -> None:
-        """用静态资源服务返回的导航顺序重绘分类栏。"""
+        """用当前资源服务返回的导航顺序重绘分类栏。"""
         for child in self.online_category_row.winfo_children():
             child.destroy()
         self.online_cate_buttons = {}
@@ -578,6 +619,32 @@ class App:
         for cid, button in self.online_cate_buttons.items():
             selected = not self.online_query and cid == self.online_cate_id
             button.configure(bg=PINK if selected else BG, fg=PANEL if selected else TEXT)
+
+    def _active_online_source(self):
+        return self.yuanqi_dynamic_source if self.online_resource_mode == "dynamic" else self.yuanqi_source
+
+    def _source_for_item(self, item: CatalogItem):
+        return self.yuanqi_dynamic_source if item.resource_kind == "dynamic" else self.yuanqi_source
+
+    @staticmethod
+    def _catalog_item_key(item: CatalogItem) -> str:
+        return f"{item.resource_kind}:{item.id}"
+
+    def _switch_resource_mode(self, mode: str) -> None:
+        if mode not in {"static", "dynamic"}:
+            return
+        self.online_resource_mode = mode
+        for key, button in self.online_mode_buttons.items():
+            button.configure(bg=GOLD if key == mode else NAV_BG)
+        self.global_search_var.set("")
+        self.local_query = ""
+        self.online_query = ""
+        self.online_cate_id = "__featured__"
+        self.online_page = 1
+        self.online_search_hint.configure(text="")
+        self.render_global_local_matches("")
+        self._render_online_categories(self._active_online_source().list_categories())
+        self.load_online_items("__featured__", 1)
 
     def _switch_online_category(self, cate_id: str) -> None:
         self.global_search_var.set("")
@@ -669,6 +736,7 @@ class App:
         self.yuanqi_auth.clear()
         clear_session()
         self.yuanqi_source.reset_session_cache()
+        self.yuanqi_dynamic_source.reset_session_cache()
         self._online_cache.clear()
         self.online_selected_id = None
         self.login_status.configure(text=self._login_status_text())
@@ -705,6 +773,8 @@ class App:
         self.online_page = page
         self.online_query = query
         self.online_search_hint.configure(text=f"全局搜索：{query}" if query else "")
+        self.online_previous_button.configure(state="disabled")
+        self.online_next_button.configure(state="disabled")
         for cid, button in self.online_cate_buttons.items():
             selected = not query and cid == cate_id
             button.configure(bg=PINK if selected else BG, fg=PANEL if selected else TEXT)
@@ -713,7 +783,8 @@ class App:
             self.online_page_label.configure(text="")
             self._online_grid_message("尚未登录。请先点击“微信扫码登录”。")
             return
-        key = (cate_id, page, query)
+        cache_mode = "all" if query else self.online_resource_mode
+        key = (cache_mode, cate_id, page, query)
         cached = self._online_cache.get(key)
         if cached is not None:
             self._set_online_items(cached)
@@ -725,13 +796,23 @@ class App:
 
     def _fetch_online(self, cate_id: str, page: int, query: str) -> None:
         try:
-            categories = self.yuanqi_source.refresh_categories()
+            source = self._active_online_source()
+            categories = source.refresh_categories()
             self._safe_after(lambda current=categories: self._render_online_categories(current))
             if query:
-                result = self.yuanqi_source.search(query, page)
+                static_result = self.yuanqi_source.search(query, page)
+                dynamic_result = self.yuanqi_dynamic_source.search(query, page)
+                result = CatalogPage(
+                    static_result.items + dynamic_result.items,
+                    page,
+                    static_result.has_more or dynamic_result.has_more,
+                    static_result.total + dynamic_result.total,
+                )
+                cache_mode = "all"
             else:
-                result = self.yuanqi_source.list_items(cate_id, page)
-            self._online_cache[(cate_id, page, query)] = result
+                result = source.list_items(cate_id, page)
+                cache_mode = self.online_resource_mode
+            self._online_cache[(cache_mode, cate_id, page, query)] = result
             self._safe_after(lambda: self._set_online_items(result))
         except (IntegrationUnavailable, CatalogError) as exc:
             self._safe_after(lambda: self._online_error(str(exc)))
@@ -747,9 +828,16 @@ class App:
         self.online_items = list(result.items)
         self.online_has_more = result.has_more
         self.online_total = result.total
+        self.online_previous_button.configure(state="normal" if self.online_page > 1 else "disabled")
+        self.online_next_button.configure(state="normal" if self.online_has_more else "disabled")
         if self.online_query:
             local_count = sum(wallpaper_matches_query(item, self.online_query) for item in self.items)
-            label = f"全局结果：本地 {local_count} 张 · 联网 {result.total or 0} 张 · 第 {self.online_page} 页"
+            static_count = sum(item.resource_kind == "static" for item in self.online_items)
+            dynamic_count = sum(item.resource_kind == "dynamic" for item in self.online_items)
+            label = (
+                f"全局结果：本地 {local_count} 张 · 联网共 {result.total or 0} 张 "
+                f"（本页静态 {static_count} / 动态 {dynamic_count}）· 第 {self.online_page} 页"
+            )
         else:
             label = f"第 {self.online_page} 页 · 共 {result.total or '?'} 条"
         self.online_page_label.configure(text=label)
@@ -757,7 +845,7 @@ class App:
             if self.online_query:
                 self._online_grid_message("联网全部分类中没有匹配结果；上方仍会保留本地图库匹配。")
             else:
-                title = next((cat.title for cat in self.yuanqi_source.list_categories() if cat.id == self.online_cate_id), "当前分类")
+                title = next((cat.title for cat in self._active_online_source().list_categories() if cat.id == self.online_cate_id), "当前分类")
                 self._online_grid_message(f"{title}暂无可验证的匹配资源；桌面画廊不会用模拟数据补齐。")
             self.status.set("当前筛选没有可验证结果。")
             return
@@ -798,14 +886,14 @@ class App:
             card = self._online_card(item)
             card.grid(row=index // 3, column=index % 3, padx=5, pady=5, sticky="nsew")
             self.online_grid.grid_columnconfigure(index % 3, weight=1)
-            self._online_card_widgets[item.id] = card
+            self._online_card_widgets[self._catalog_item_key(item)] = card
         if end < len(self.online_items):
             self.root.after_idle(lambda: self._render_online_grid_batched(end))
         else:
             self._update_online_borders()
 
     def _online_card(self, item: CatalogItem) -> tk.Frame:
-        selected = item.id == self.online_selected_id
+        selected = self._catalog_item_key(item) == self.online_selected_id
         card = tk.Frame(self.online_grid, bg=PANEL, highlightbackground=GOLD if selected else PANEL,
                         highlightthickness=3 if selected else 0, cursor="hand2")
         photo = self.online_thumbnail_for(item, (380, 214)); self.online_photo_refs.append(photo)
@@ -813,7 +901,7 @@ class App:
         name = tk.Label(picture, text=item.title, bg="#20232a", fg="#ffffff", anchor="w",
                         font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3)
         name.place(x=8, y=8)
-        meta_text = item.category_name or "精选"
+        meta_text = "动态预览转静态" if item.resource_kind == "dynamic" else (item.category_name or "精选")
         if item.resolution:
             meta_text += " · " + item.resolution
         meta = tk.Label(card, text=meta_text, bg=PANEL, fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 8))
@@ -847,15 +935,19 @@ class App:
         return ImageTk.PhotoImage(ImageOps.fit(image, size, Image.Resampling.LANCZOS))
 
     def selected_online(self) -> CatalogItem | None:
-        return next((item for item in self.online_items if item.id == self.online_selected_id), None)
+        return next((item for item in self.online_items if self._catalog_item_key(item) == self.online_selected_id), None)
 
     def select_online(self, item: CatalogItem) -> None:
-        self.online_selected_id = item.id
+        self.online_selected_id = self._catalog_item_key(item)
         self._update_online_borders()
         if hasattr(self, "online_download_button"):
             self.online_download_button.configure(state="normal")
             self.online_apply_button.configure(state="normal")
-        self.status.set(f"已选择：{item.title}；双击卡片可查看大图。")
+            dynamic = item.resource_kind == "dynamic"
+            self.online_download_button.configure(text="转换到本地" if dynamic else "下载到本地")
+            self.online_apply_button.configure(text="转换并设为壁纸" if dynamic else "下载并设为壁纸")
+        suffix = "；将从预览视频多点选取高清帧。" if item.resource_kind == "dynamic" else "；双击卡片可查看大图。"
+        self.status.set(f"已选择：{item.title}{suffix}")
 
     def show_online_detail(self, item: CatalogItem | None = None) -> None:
         item = item or self.selected_online()
@@ -870,10 +962,21 @@ class App:
         tk.Label(top, text=item.title, bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(side="left")
         meta = " · ".join(part for part in (item.category_name, item.author, item.resolution, item.format) if part)
         tk.Label(top, text=meta, bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 10)).pack(side="left", padx=12)
+        if item.resource_kind == "dynamic":
+            tk.Label(
+                dialog,
+                text="画面预览仅用于浏览；转换时会从原始 preview_video 的 5 个时间点解码全分辨率帧并自动择优，不取首帧。",
+                bg=PANEL,
+                fg=PINK,
+                anchor="w",
+                font=("Microsoft YaHei UI", 9, "bold"),
+            ).pack(fill="x", padx=16, pady=(0, 3))
         image_label = tk.Label(dialog, bg="#d8dce6"); image_label.pack(fill="both", expand=True, padx=16, pady=6)
         actions = tk.Frame(dialog, bg=PANEL); actions.pack(fill="x", padx=16, pady=(6, 14))
-        self.button(actions, "下载到本地图库", lambda: self._download_item_to_library(item)).pack(side="left", padx=(0, 8))
-        self.button(actions, "下载并应用为壁纸", lambda: self._apply_item(item)).pack(side="left", padx=(0, 8))
+        download_label = "转换到本地图库" if item.resource_kind == "dynamic" else "下载到本地图库"
+        apply_label = "转换并应用为壁纸" if item.resource_kind == "dynamic" else "下载并应用为壁纸"
+        self.button(actions, download_label, lambda: self._download_item_to_library(item)).pack(side="left", padx=(0, 8))
+        self.button(actions, apply_label, lambda: self._apply_item(item)).pack(side="left", padx=(0, 8))
         self.status.set(f"正在加载大图：{item.title}")
         threading.Thread(target=self._load_detail_image, args=(item, image_label), daemon=True).start()
 
@@ -889,7 +992,7 @@ class App:
         self._safe_after(lambda: label.configure(image=photo))
 
     def _online_save_target(self, item: CatalogItem) -> Path:
-        suffix = Path(item.original_url or "").suffix.lower()
+        suffix = ".jpg" if item.resource_kind == "dynamic" else Path(item.original_url or "").suffix.lower()
         if suffix not in IMAGE_EXTENSIONS:
             suffix = ".jpg"
         WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
@@ -903,17 +1006,31 @@ class App:
         self._download_item_to_library(item)
 
     def _download_item_to_library(self, item: CatalogItem) -> None:
-        self.status.set(f"正在下载：{item.title}")
+        if item.resource_kind == "dynamic":
+            self.status.set(f"正在下载动态预览并从 5 个时间点选择高清帧：{item.title}")
+        else:
+            self.status.set(f"正在下载：{item.title}")
 
         def work() -> None:
+            target: Path | None = None
             try:
-                data = self.yuanqi_source.download_original(item.id)
+                source_adapter = self._source_for_item(item)
+                data = source_adapter.download_original(item.id)
                 target = self._online_save_target(item)
                 target.write_bytes(data)
-                wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source="元气联网下载")
+                if not is_valid_static_image(target):
+                    raise CatalogError("生成文件没有通过静态图片校验")
+                if item.resource_kind == "dynamic":
+                    summary = source_adapter.conversion_summary(item.id)
+                    source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
+                else:
+                    source_name = "元气联网下载"
+                wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source=source_name)
                 self._safe_after(lambda: self._finish_online_download(wallpaper, None))
             except (CatalogError, OSError, ValueError) as exc:
-                self._safe_after(lambda: self._finish_online_download(None, exc))
+                if target is not None:
+                    target.unlink(missing_ok=True)
+                self._safe_after(lambda error=exc: self._finish_online_download(None, error))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -925,8 +1042,10 @@ class App:
         self.items.append(wallpaper)
         self.selected_id = wallpaper.id
         self.refresh()
-        self.status.set(f"已下载并加入本地图库：{wallpaper.title}")
-        messagebox.showinfo("下载成功", f"已把“{wallpaper.title}”下载到本地图库。可到“本地壁纸”页预览或应用。")
+        conversion = wallpaper.source if wallpaper.source.startswith("元气动态预览转静态") else ""
+        self.status.set(f"已加入本地图库：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
+        detail = f"\n转换信息：{conversion}" if conversion else ""
+        messagebox.showinfo("转换成功" if conversion else "下载成功", f"已把“{wallpaper.title}”加入本地图库。{detail}\n可到“本地壁纸”页预览或应用。")
 
     def apply_online_selected(self) -> None:
         item = self.selected_online()
@@ -936,18 +1055,32 @@ class App:
         self._apply_item(item)
 
     def _apply_item(self, item: CatalogItem) -> None:
-        self.status.set(f"正在下载并应用：{item.title}")
+        if item.resource_kind == "dynamic":
+            self.status.set(f"正在转换动态预览并交给 Windows 原生壁纸接口：{item.title}")
+        else:
+            self.status.set(f"正在下载并应用：{item.title}")
 
         def work() -> None:
+            target: Path | None = None
             try:
-                data = self.yuanqi_source.download_original(item.id)
+                source_adapter = self._source_for_item(item)
+                data = source_adapter.download_original(item.id)
                 target = self._online_save_target(item)
                 target.write_bytes(data)
+                if not is_valid_static_image(target):
+                    raise CatalogError("生成文件没有通过静态图片校验")
                 set_native_wallpaper(target)
-                wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source="元气联网下载")
+                if item.resource_kind == "dynamic":
+                    summary = source_adapter.conversion_summary(item.id)
+                    source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
+                else:
+                    source_name = "元气联网下载"
+                wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source=source_name)
                 self._safe_after(lambda: self._finish_online_apply(wallpaper, None))
             except (CatalogError, OSError, ValueError) as exc:
-                self._safe_after(lambda: self._finish_online_apply(None, exc))
+                if target is not None:
+                    target.unlink(missing_ok=True)
+                self._safe_after(lambda error=exc: self._finish_online_apply(None, error))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -959,8 +1092,10 @@ class App:
         self.items.append(wallpaper)
         self.selected_id = wallpaper.id
         self.refresh()
-        self.status.set(f"已应用为 Windows 原生壁纸：{wallpaper.title}")
-        messagebox.showinfo("应用成功", f"“{wallpaper.title}”已由 Windows 注册表复核应用成功。")
+        conversion = wallpaper.source if wallpaper.source.startswith("元气动态预览转静态") else ""
+        self.status.set(f"已应用为 Windows 原生壁纸：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
+        detail = f"\n转换信息：{conversion}" if conversion else ""
+        messagebox.showinfo("应用成功", f"“{wallpaper.title}”已由 Windows 注册表复核应用成功。{detail}")
 
     def _launch_wechat_login_window(self) -> dict | None:
         """以独立子进程拉起微信登录窗，读取其 stdout 返回的会话结构。"""
@@ -1026,6 +1161,7 @@ class App:
         self.login_status.configure(text=self._login_status_text())
         self.logout_button.configure(state="normal")
         self.yuanqi_source.reset_session_cache()
+        self.yuanqi_dynamic_source.reset_session_cache()
         self._online_cache.clear()
         self.load_online_items("__featured__", 1)
         messagebox.showinfo("登录成功", "已用微信扫码登录元气账号，并已加密保存在本机。\n下次启动将自动保持登录。")
