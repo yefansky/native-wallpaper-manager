@@ -335,6 +335,7 @@ class App:
         self._online_cache: dict[tuple[str, str, int, str], object] = {}
         self._thumb_cache: dict[str, bytes] = {}
         self._thumb_cache_lock = threading.Lock()
+        self._thumbnail_http_local = threading.local()
         self._thumbnail_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="wallpaper-preview")
         self._thumbnail_futures: set[Future] = set()
         self._thumbnail_futures_lock = threading.Lock()
@@ -1309,11 +1310,16 @@ class App:
         return ImageTk.PhotoImage(image)
 
     def _fetch_online_thumbnail_image(self, item: CatalogItem, size: tuple[int, int]) -> Image.Image:
+        source_url = item.large_preview_url if size[0] >= 500 and item.large_preview_url else item.preview_url
         with self._thumb_cache_lock:
-            raw = self._thumb_cache.get(item.preview_url)
+            raw = self._thumb_cache.get(source_url)
         if raw is None:
             try:
-                response = requests.get(item.preview_url, timeout=20)
+                http = getattr(self._thumbnail_http_local, "session", None)
+                if http is None:
+                    http = requests.Session()
+                    self._thumbnail_http_local.session = http
+                response = http.get(source_url, timeout=20)
                 response.raise_for_status()
                 raw = response.content
                 if len(raw) > 16 * 1024 * 1024:
@@ -1326,7 +1332,7 @@ class App:
                     image = decoded.convert("RGB")
                     image.load()
                 with self._thumb_cache_lock:
-                    self._thumb_cache[item.preview_url] = raw
+                    self._thumb_cache[source_url] = raw
             else:
                 raise ValueError("no cached bytes")
         except (OSError, ValueError):
@@ -1461,7 +1467,7 @@ class App:
 
     def _load_detail_image(self, item: CatalogItem, label: tk.Label) -> None:
         try:
-            response = requests.get(item.original_url or item.preview_url, timeout=30)
+            response = requests.get(item.large_preview_url or item.original_url or item.preview_url, timeout=30)
             image = Image.open(io.BytesIO(response.content)).convert("RGB")
         except (OSError, ValueError, requests.RequestException):
             image = Image.new("RGB", (820, 460), "#d8dce6")

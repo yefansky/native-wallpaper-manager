@@ -605,6 +605,40 @@ class CoreTests(unittest.TestCase):
                 window._thumbnail_executor.shutdown(wait=True, cancel_futures=True)
             root.destroy()
 
+    def test_dynamic_cards_use_mid_preview_while_carousel_uses_large_preview(self):
+        output = io.BytesIO()
+        Image.new("RGB", (960, 540), "#336699").save(output, format="JPEG")
+        response = unittest.mock.Mock(content=output.getvalue())
+        response.raise_for_status.return_value = None
+        http = unittest.mock.Mock()
+        http.get.return_value = response
+
+        class PreviewHarness:
+            _thumb_cache = {}
+            _thumb_cache_lock = threading.Lock()
+            _thumbnail_http_local = threading.local()
+
+        harness = PreviewHarness()
+        harness._thumbnail_http_local.session = http
+        item = CatalogItem(
+            "dynamic-preview", "分层预览",
+            "https://img-baofun.zhhainiao.com/mid.jpg",
+            large_preview_url="https://img-baofun.zhhainiao.com/raw.jpg",
+            resource_kind="dynamic",
+            source_video_url="https://img-baofun.zhhainiao.com/protected.mp4",
+        )
+
+        card = app.App._fetch_online_thumbnail_image(harness, item, (380, 214))
+        hero = app.App._fetch_online_thumbnail_image(harness, item, (960, 400))
+
+        self.assertEqual(card.size, (380, 214))
+        self.assertEqual(hero.size, (960, 400))
+        self.assertEqual(
+            [call.args[0] for call in http.get.call_args_list],
+            [item.preview_url, item.large_preview_url],
+        )
+        self.assertNotIn(item.source_video_url, [call.args[0] for call in http.get.call_args_list])
+
     def test_global_online_search_merges_static_and_dynamic_results(self):
         root = app.tk.Tk()
         root.withdraw()
@@ -921,6 +955,7 @@ class CoreTests(unittest.TestCase):
             "wid": 730193,
             "wname": "竹林下雨",
             "preview_jpg_raw": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/frame.jpg",
+            "preview_jpg_mid": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/frame-mid.jpg",
             "preview_video": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/preview/demo_preview.mp4",
             "video": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/protected.mp4",
             "resolution": "3840*2160",
@@ -932,11 +967,44 @@ class CoreTests(unittest.TestCase):
             page = source.list_items("cate:2")
         item = page.items[0]
         self.assertEqual(item.resource_kind, "dynamic")
+        self.assertEqual(item.preview_url, raw["preview_jpg_mid"])
+        self.assertEqual(item.large_preview_url, raw["preview_jpg_raw"])
         self.assertEqual(item.preview_video_url, raw["preview_video"])
         # 干净高清源视频（XOR 混淆）优先于带 HUD 的 preview_video。
         self.assertEqual(item.source_video_url, raw["video"])
         self.assertEqual(source.download_original(item.id), b"jpeg-data")
         converter.assert_called_once_with(raw["video"], http=source._http, decrypt=True)
+
+    def test_dynamic_preview_falls_back_when_mid_url_is_untrusted(self):
+        raw = {
+            "wid": 730194,
+            "preview_jpg_mid": "http://untrusted.example/frame-mid.jpg",
+            "preview_jpg_raw": "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/frame.jpg",
+        }
+
+        item = YuanqiDynamicResourceSource._parse_item(raw)
+
+        self.assertEqual(item.preview_url, raw["preview_jpg_raw"])
+        self.assertEqual(item.large_preview_url, raw["preview_jpg_raw"])
+
+    def test_dynamic_item_ignores_nonstandard_preview_video(self):
+        item = YuanqiDynamicResourceSource._parse_item({
+            "wid": 730195,
+            "preview_jpg": "https://img-baofun.zhhainiao.com/frame.jpg",
+            "preview_video": "https://img-baofun.zhhainiao.com/full-video.mp4",
+        })
+
+        self.assertEqual(item.preview_video_url, "")
+
+    def test_dynamic_item_accepts_current_yuanqi_preview_cdn(self):
+        item = YuanqiDynamicResourceSource._parse_item({
+            "wid": 730196,
+            "preview_jpg_mid": "https://cdn-img-wallpaper.yuanqidesk3.com/live/frame.jpg",
+            "preview_video": "https://cdn-img-wallpaper.yuanqidesk3.com/preview/frame_preview.mp4",
+        })
+
+        self.assertTrue(item.preview_url.endswith("frame.jpg"))
+        self.assertTrue(item.preview_video_url.endswith("frame_preview.mp4"))
 
     def test_dynamic_source_failure_falls_back_to_preview_video(self):
         converted = ConvertedFrame(b"preview-jpeg", 1920, 1080, 3.3, 100.0, 5)

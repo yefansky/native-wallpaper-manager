@@ -43,6 +43,7 @@ RESOURCE_IMAGE_HOSTS = {
     "img-baofun.zhhainiao.com",
     "mobile-img-baofun.zhhainiao.com",
     "cdnpcwallpaper.zhhainiao.com",
+    "cdn-img-wallpaper.yuanqidesk3.com",
     "wallpaper-static.cheetahfun.com",
 }
 _RESOURCE_IMAGE_HOST_SUFFIXES = (".baofun.zhhainiao.com", ".cheetahfun.com")
@@ -81,6 +82,7 @@ class CatalogItem:
     title: str
     preview_url: str
     original_url: str | None = None
+    large_preview_url: str = ""
     category_id: str = ""
     category_name: str = ""
     author: str = ""
@@ -136,6 +138,19 @@ def validate_resource_image_url(url: str) -> str:
     return url
 
 
+def first_valid_resource_image_url(*candidates: object) -> str:
+    """返回首个可信图片地址；单个失效候选不能拖垮整页目录。"""
+    for candidate in candidates:
+        url = str(candidate or "").strip()
+        if not url:
+            continue
+        try:
+            return validate_resource_image_url(url)
+        except CatalogError:
+            continue
+    return ""
+
+
 def validate_resource_preview_video_url(url: str) -> str:
     """只接受元气图片 CDN 上公开、标准的 preview MP4。"""
     parsed = urlparse(url)
@@ -146,6 +161,19 @@ def validate_resource_preview_video_url(url: str) -> str:
     if not parsed.path.lower().endswith("_preview.mp4"):
         raise CatalogError("动态资源没有标准 preview_video，拒绝读取完整视频或私有容器")
     return url
+
+
+def first_valid_resource_preview_video_url(*candidates: object) -> str:
+    """返回首个标准预览视频；异常预览不能阻塞图片目录。"""
+    for candidate in candidates:
+        url = str(candidate or "").strip()
+        if not url:
+            continue
+        try:
+            return validate_resource_preview_video_url(url)
+        except CatalogError:
+            continue
+    return ""
 
 
 def validate_resource_source_video_url(url: str) -> str:
@@ -536,20 +564,21 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
             is_theme = int(raw.get("sub_wtype") or 0) == 2 or int(raw.get("theme_type") or 0) == 1
         except (TypeError, ValueError):
             is_theme = False
-        preview = str(raw.get("preview_jpg_raw") or raw.get("preview_jpg_mid") or raw.get("preview_jpg") or "")
-        preview_video = str(raw.get("preview_video") or "")
+        # 卡片只取与 380×214 展示尺寸接近的中/小预览；大预览仅供轮播与详情使用。
+        preview = first_valid_resource_image_url(
+            raw.get("preview_jpg_mid"), raw.get("preview_jpg"), raw.get("preview_jpg_raw")
+        )
+        large_preview = first_valid_resource_image_url(raw.get("preview_jpg_raw"), preview)
+        preview_video = first_valid_resource_preview_video_url(raw.get("preview_video"))
         # 干净高清源视频：优先 4K/2K/1920，最后回退基础 video（均带 XOR 混淆）。
         source_video = (
             str(raw.get("video_4k") or raw.get("video_2k") or raw.get("video_1920") or raw.get("video") or "")
         )
-        if preview:
-            validate_resource_image_url(preview)
-        if preview_video:
-            validate_resource_preview_video_url(preview_video)
         return CatalogItem(
             id=str(raw.get("wid") or raw.get("id") or ""),
             title=str(raw.get("wname") or raw.get("title") or "未命名动态壁纸"),
             preview_url=preview,
+            large_preview_url=large_preview,
             original_url=preview or None,
             category_id=str(raw.get("cate_id") or raw.get("cid") or ""),
             category_name=str(raw.get("cname") or "动态转静态"),
