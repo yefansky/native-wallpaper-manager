@@ -1,0 +1,5 @@
+.echo [yuanqi-research] one-shot pre-authentication login URL capture
+.echo [yuanqi-research] breakpoint is placed immediately before the browser client is initialized
+.echo [yuanqi-research] the debugger detaches after the first hit; no QR, cookie or session value is inspected
+bp kvipgui+0x40a6b ".echo [yuanqi-research] login-url; .if (poi(ebp-44) >= 8) { du poi(ebp-58) } .else { du ebp-58 }; qd"
+g

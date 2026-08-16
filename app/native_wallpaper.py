@@ -6,11 +6,15 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import urllib.parse
 import urllib.request
 import uuid
 import winreg
+
+import requests
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import tkinter as tk
@@ -20,6 +24,7 @@ from PIL import Image, ImageOps, ImageTk
 
 from catalog import YuanqiOfficialApiSource
 from yuanqi_auth import (
+    AuthPhase,
     BRIDGE_METHODS,
     LOGIN_OPTIONS,
     PHONE_LOGIN_SURFACE,
@@ -28,9 +33,9 @@ from yuanqi_auth import (
     KVIPGUI_LOGIN_BRIDGE_BOUNDARY,
     WECHAT_LOGIN_SURFACE,
     WECHAT_AUTH_RETURN_SURFACE,
-    UnavailableYuanqiLoginBackend,
     YuanqiAuthCoordinator,
 )
+from wechat_login import WechatQrLoginBackend, log_diag, sha8
 
 APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
 WALLPAPER_DIR = APP_DIR / "wallpapers"
@@ -249,7 +254,8 @@ class App:
         self.root.configure(bg=BG)
         self.config = load_config()
         self.yuanqi_source = YuanqiOfficialApiSource()
-        self.yuanqi_auth = YuanqiAuthCoordinator(UnavailableYuanqiLoginBackend())
+        self.wechat_backend = WechatQrLoginBackend()
+        self.yuanqi_auth = YuanqiAuthCoordinator(self.wechat_backend)
         self.items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
         self.filter_favorites = False
         self.local_page = 0
@@ -392,16 +398,130 @@ class App:
         online = tk.Frame(content, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=26, pady=24)
         online.pack(side="left", fill="both", expand=True, padx=(8, 0))
         tk.Label(online, text="电脑版登录宿主", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
-        tk.Label(online, text="已复刻 navigate2Login → callbackOnLogin → 用户/设备信息 → 服务端校验的状态机。",
+        tk.Label(online, text="已接入官方公开登录页：由本客户端拉起微信扫码，页面用 code 换会话并经资源服务校验。",
                  bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 10), pady=10).pack(anchor="w")
-        tk.Label(online, text=f"当前状态：{self.yuanqi_auth.snapshot.message}", bg=PANEL, fg=PINK,
-                 justify="left", wraplength=500, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        tk.Label(online, text="不会复用官方客户端令牌；真实登录仍需元气给本客户端签发身份和授权回调。",
+        self.login_status = tk.Label(online, text=f"当前状态：{self.yuanqi_auth.snapshot.message}", bg=PANEL, fg=PINK,
+                                     justify="left", wraplength=500, font=("Microsoft YaHei UI", 10, "bold"))
+        self.login_status.pack(anchor="w")
+        tk.Label(online, text="扫码、确认由你本人完成；本客户端只读取内存中的新会话，不读官方客户端令牌。",
                  bg=PANEL, fg=MUTED, justify="left", wraplength=500, font=("Microsoft YaHei UI", 9), pady=8).pack(anchor="w")
         online_actions = tk.Frame(online, bg=PANEL); online_actions.pack(anchor="w", pady=(10, 0))
-        self.button(online_actions, "查看桥接自检", self.show_yuanqi_auth_status, accent=True).pack(side="left", padx=(0, 8))
+        self.button(online_actions, "微信扫码登录", self.start_wechat_login, accent=True).pack(side="left", padx=(0, 8))
+        self.button(online_actions, "查看桥接自检", self.show_yuanqi_auth_status).pack(side="left", padx=(0, 8))
         self.button(online_actions, "在浏览器核验官网", lambda: self.open_official_catalog(OFFICIAL_CATALOG_URL)).pack(side="left")
+        self.browse_online_button = self.button(online_actions, "联网浏览壁纸", self.browse_online_wallpapers)
+        self.browse_online_button.pack(side="left", padx=(0, 8))
+        self.browse_online_button.configure(state="disabled" if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED else "normal")
         return page
+
+    def browse_online_wallpapers(self) -> None:
+        """用会话访问联网壁纸资源；ret==0 且返回真实列表即资源访问成功。"""
+        if self.yuanqi_auth.snapshot.phase != AuthPhase.AUTHENTICATED:
+            messagebox.showinfo("需要登录", "请先微信扫码登录。")
+            return
+        session = self.wechat_backend.get_user_info()
+        device_id = self.wechat_backend.get_device_info()["deviceId"]
+        body = {
+            "login_info": {},
+            "common": {
+                "platform": "pc",
+                "open_id": session["uid"],
+                "token": session["token"],
+                "device_id": device_id,
+                "player_version": 1,
+            },
+            "page": 1,
+            "page_size": 4,
+            "cate_id": 0,
+            "tag_id": 0,
+            "sort_type": 1,
+        }
+        self.status.set("正在访问联网壁纸资源……")
+        try:
+            response = requests.post("https://pcwallpaper.zhhainiao.com/wallpaper/static/list", json=body, timeout=15)
+            payload = response.json()
+            ret = payload.get("resp_common", {}).get("ret")
+            items = (payload.get("data") or {}).get("list") or []
+        except (OSError, ValueError) as exc:
+            self.status.set(f"联网资源访问失败：{exc}")
+            messagebox.showerror("联网资源失败", str(exc))
+            return
+        if ret != 0:
+            self.status.set(f"联网资源拒绝访问：ret={ret}")
+            messagebox.showwarning("联网资源", f"服务端返回 ret={ret}，未取得资源。")
+            return
+        total = (payload.get("data") or {}).get("total", len(items))
+        lines = []
+        for item in items[:4]:
+            name = str(item.get("wname") or item.get("title") or "")
+            url = str(item.get("jpg_url") or item.get("preview_jpg") or "")
+            lines.append(f"· {name[:30]}" + (f"\n  {url[:60]}" if url else ""))
+        self.status.set(f"联网资源访问成功：total={total}，本次取得 {len(items)} 条。")
+        messagebox.showinfo(
+            "联网资源访问成功",
+            f"已用会话访问 pcwallpaper.zhhainiao.com 壁纸资源，ret=0。\n\n本次取得（共 {total} 条）：\n" + "\n".join(lines),
+        )
+
+    def _launch_wechat_login_window(self) -> dict | None:
+        """以独立子进程拉起微信登录窗，读取其 stdout 返回的会话结构。"""
+        project_root = Path(__file__).resolve().parents[1]
+        command = [sys.executable, str(project_root / "app" / "wechat_login_window.py")]
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=720, encoding="utf-8")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.status.set(f"微信登录窗口异常：{exc}")
+            return None
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    def start_wechat_login(self) -> None:
+        """由本客户端发起微信扫码登录：弹出官方二维码窗口，等待本人扫码。"""
+        self.status.set("正在弹出微信扫码登录窗口……")
+
+        def work() -> None:
+            result = self._launch_wechat_login_window()
+            self.root.after(0, lambda: self._finish_wechat_login(result))
+
+        threading.Thread(target=work, daemon=True).start()
+        messagebox.showinfo("微信扫码登录", "即将弹出官方微信登录窗口。\n请用微信扫描二维码并在手机端确认；确认后本客户端会自动读取会话并校验。")
+
+    def _finish_wechat_login(self, result: dict | None) -> None:
+        if not result or not result.get("ok"):
+            message = (result or {}).get("message", "登录未完成。")
+            self.status.set(f"微信登录未成功：{message}")
+            messagebox.showwarning("微信登录", message)
+            return
+        session = result.get("session") or {}
+        token = str(session.get("token") or "")
+        open_id = str(session.get("open_id") or "")
+        device_id = str(session.get("device_id") or "")
+        log_diag(
+            f"login window result ok=True verified={result.get('verified')} "
+            f"open_id={sha8(open_id)} token_len={len(token)} device={sha8(device_id)}"
+        )
+        if not (token and open_id and device_id):
+            log_diag("login window 会话不完整")
+            self.status.set("微信登录返回的会话不完整。")
+            messagebox.showerror("会话校验失败", "登录窗返回的会话缺少 token/open_id/device_id。")
+            return
+        self.wechat_backend.store_session(token, open_id, device_id)
+        snapshot = self.yuanqi_auth.callback_on_login({"ret": 0})
+        if snapshot.phase != AuthPhase.AUTHENTICATED:
+            log_diag(f"app 会话校验未通过 phase={snapshot.phase} message={snapshot.message}")
+            self.status.set(f"会话校验未通过：{snapshot.message}")
+            messagebox.showerror("会话校验失败", f"{snapshot.message}\n\n请把“我的资料库\\AppData\\Local\\NativeWallpaperManager\\login_debug.log”内容发给我定位。")
+            return
+        log_diag("app 会话校验通过 AUTHENTICATED")
+        self.status.set("微信登录成功：账号、设备与资源服务会话均已由服务端校验。")
+        self.login_status.configure(text=f"当前状态：{snapshot.message}")
+        self.browse_online_button.configure(state="normal")
+        messagebox.showinfo("登录成功", "已用微信扫码登录元气账号，并取得服务端可校验的会话。")
 
     def show_yuanqi_auth_status(self) -> None:
         methods = "\n".join(
