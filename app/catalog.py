@@ -108,6 +108,7 @@ class CatalogPage:
     page: int
     has_more: bool
     total: int = 0
+    featured_items: tuple[CatalogItem, ...] = ()
 
 
 class CatalogSource(Protocol):
@@ -594,7 +595,8 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
             total = int(data.get("total") or 0)
         except (TypeError, ValueError):
             total = 0
-        return CatalogPage(items, page, len(raw_items) >= page_size, total)
+        today_hot = items[:5] if page == 1 else ()
+        return CatalogPage(items, page, len(raw_items) >= page_size, total, today_hot)
 
     def _special_page(self, url: str, page: int, page_size: int = PAGE_SIZE) -> CatalogPage:
         return self._page_from_list_payload(self._post(url, self._dynamic_body(page, page_size)), page)
@@ -802,12 +804,14 @@ class YuanqiThemeResourceSource(YuanqiDynamicResourceSource):
                 },
             )
             items = self._theme_items(payload.get("data") or ())
+            featured_items: tuple[CatalogItem, ...] = ()
             if current == 1:
-                seen = {item.id for item in items}
-                items = tuple(item for item in self._carousel() if item.id not in seen) + items
+                featured_items = self._carousel()
+                featured_ids = {item.id for item in featured_items}
+                items = featured_items + tuple(item for item in items if item.id not in featured_ids)
             has_more = bool(payload.get("has_more"))
             next_cursor = str(payload.get("cursor") or "")
-            self._featured_pages[current] = CatalogPage(items, current, has_more, 0)
+            self._featured_pages[current] = CatalogPage(items, current, has_more, 0, featured_items)
             if has_more and next_cursor:
                 self._featured_cursors[current + 1] = next_cursor
         return self._featured_pages.get(page, CatalogPage((), page, False, 0))

@@ -279,6 +279,27 @@ class CoreTests(unittest.TestCase):
         labels = [category.title for category in YuanqiDynamicResourceSource().list_categories()]
         self.assertEqual(labels, ["关注", "精选", "最新"])
 
+    def test_dynamic_featured_marks_first_five_as_today_hot(self):
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}
+        )
+        raw_items = [
+            {
+                "wid": index,
+                "wname": f"热榜{index}",
+                "preview_jpg_raw": f"https://img-baofun.zhhainiao.com/{index}.jpg",
+                "preview_video": f"https://img-baofun.zhhainiao.com/{index}_preview.mp4",
+            }
+            for index in range(1, 7)
+        ]
+        with patch("catalog.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "resp_common": {"ret": 0}, "data": {"items": raw_items, "total": 24}
+            }
+            page = source.list_items("__featured__", 1)
+        self.assertEqual([item.id for item in page.featured_items], ["1", "2", "3", "4", "5"])
+        self.assertEqual(len(page.items), 6)
+
     def test_dynamic_candidate_sampling_never_uses_first_frame(self):
         points = candidate_timestamps(10.0)
         self.assertEqual(len(points), 5)
@@ -410,6 +431,88 @@ class CoreTests(unittest.TestCase):
             )
             load_online.assert_called_once_with("__featured__", 1)
         finally:
+            root.destroy()
+
+    def test_dynamic_featured_renders_five_manual_controls_and_auto_rotation(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        window = None
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            window.online_resource_mode = "dynamic"
+            window.online_cate_id = "__featured__"
+            window.online_page = 1
+            items = tuple(
+                CatalogItem(
+                    str(index), f"今日热榜{index}", f"https://img-baofun.zhhainiao.com/{index}.jpg",
+                    resource_kind="dynamic",
+                )
+                for index in range(1, 7)
+            )
+            result = CatalogPage(items, 1, True, 24, items[:5])
+            with patch.object(window, "_queue_featured_thumbnail"), patch.object(window, "_queue_online_thumbnail"):
+                window._set_online_items(result)
+                root.update_idletasks()
+            self.assertEqual(window._featured_carousel_kind, "dynamic")
+            self.assertEqual(len(window._featured_indicator_buttons), 5)
+            self.assertEqual([item.id for item in window.online_grid_items], ["6"])
+            self.assertIsNotNone(window._featured_carousel_after_id)
+            root.after_cancel(window._featured_carousel_after_id)
+            window._featured_carousel_after_id = None
+            window._advance_featured_carousel(window._preview_generation)
+            self.assertEqual(window._featured_carousel_index, 1)
+            self.assertEqual(window.online_selected_id, "dynamic:1")
+            self.assertIsNotNone(window._featured_carousel_after_id)
+            window._set_featured_carousel_index(3, select=True)
+            self.assertEqual(window._featured_carousel_index, 3)
+            self.assertEqual(window.online_selected_id, "dynamic:4")
+            window._clear_online_grid()
+            self.assertIsNone(window._featured_carousel_after_id)
+        finally:
+            if window is not None:
+                window._cancel_featured_carousel()
+                window._thumbnail_executor.shutdown(wait=True, cancel_futures=True)
+            root.update()
+            for callback_id in root.tk.splitlist(root.tk.call("after", "info")):
+                root.after_cancel(callback_id)
+            root.destroy()
+
+    def test_theme_featured_renders_hot_theme_strip_with_left_right_switching(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        window = None
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            window.online_resource_mode = "theme"
+            window.online_cate_id = "__featured__"
+            window.online_page = 1
+            items = tuple(
+                CatalogItem(
+                    str(index), f"热门主题{index}", f"https://img-baofun.zhhainiao.com/theme-{index}.jpg",
+                    resource_kind="theme",
+                )
+                for index in range(1, 5)
+            )
+            result = CatalogPage(items, 1, True, 0, items[:3])
+            with patch.object(window, "_queue_featured_thumbnail"), patch.object(window, "_queue_online_thumbnail"):
+                window._set_online_items(result)
+                root.update_idletasks()
+            self.assertEqual(window._featured_carousel_kind, "theme")
+            self.assertEqual(len(window._featured_theme_labels), 3)
+            self.assertEqual([item.id for item in window.online_grid_items], ["4"])
+            self.assertIsNone(window._featured_carousel_after_id)
+            window._change_featured_carousel(1)
+            self.assertEqual(window._featured_carousel_index, 1)
+            self.assertEqual(window.online_selected_id, "theme:2")
+        finally:
+            if window is not None:
+                window._cancel_featured_carousel()
+                window._thumbnail_executor.shutdown(wait=True, cancel_futures=True)
+            root.update()
+            for callback_id in root.tk.splitlist(root.tk.call("after", "info")):
+                root.after_cancel(callback_id)
             root.destroy()
 
     def test_computer_theme_nav_uses_theme_catalog_as_its_own_page(self):
@@ -798,7 +901,9 @@ class CoreTests(unittest.TestCase):
             first = source.list_items("__featured__", 1)
             second = source.list_items("__featured__", 2)
         self.assertEqual([item.id for item in first.items], ["1", "2"])
+        self.assertEqual([item.id for item in first.featured_items], ["1"])
         self.assertEqual([item.id for item in second.items], ["3"])
+        self.assertEqual(second.featured_items, ())
         self.assertTrue(first.has_more)
         self.assertFalse(second.has_more)
         page_requests = [call.kwargs["json"] for call in mock_post.call_args_list if call.args[0].endswith("themes_by_page")]

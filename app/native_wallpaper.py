@@ -107,6 +107,7 @@ SPI_SETDESKWALLPAPER = 20
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
 LOCAL_PAGE_SIZE = 12
+FEATURED_CAROUSEL_INTERVAL_MS = 5000
 BG, PANEL, TEXT, MUTED, GOLD, PINK, LINE = "#ffffff", "#ffffff", "#171b27", "#7d8493", "#ffc400", "#ff4f8b", "#edf0f4"
 NAV_BG, SOFT_BG, SELECT_BG = "#f3f4f6", "#f7f8fa", "#fff5cc"
 
@@ -323,6 +324,8 @@ class App:
         self._last_wallpaper_resource_mode = "static"
         self.online_photo_refs: list[ImageTk.PhotoImage] = []
         self.online_items: list[CatalogItem] = []
+        self.online_grid_items: list[CatalogItem] = []
+        self.online_featured_items: list[CatalogItem] = []
         self.online_selected_id: str | None = None
         self.online_cate_id = "__featured__"
         self.online_page = 1
@@ -338,6 +341,15 @@ class App:
         self._preview_generation = 0
         self._online_card_widgets: dict[str, tk.Frame] = {}
         self._online_image_widgets: dict[str, tk.Label] = {}
+        self._featured_carousel_after_id: str | None = None
+        self._featured_carousel_index = 0
+        self._featured_carousel_kind = ""
+        self._featured_carousel_frame: tk.Frame | None = None
+        self._featured_main_container: tk.Frame | None = None
+        self._featured_main_label: tk.Label | None = None
+        self._featured_title_label: tk.Label | None = None
+        self._featured_indicator_buttons: list[tk.Button] = []
+        self._featured_theme_labels: list[tk.Label] = []
         self._loading_online = False
         self._ui_queue: queue.Queue = queue.Queue()
         self.root.after(80, self._poll_ui_queue)
@@ -777,6 +789,7 @@ class App:
         self._safe_after(self._quit_app)
 
     def _quit_app(self) -> None:
+        self._cancel_featured_carousel()
         self._thumbnail_executor.shutdown(wait=False, cancel_futures=True)
         try:
             self.tray_icon.stop()
@@ -900,8 +913,15 @@ class App:
             child.destroy()
 
     def _set_online_items(self, result) -> None:
+        self._cancel_featured_carousel()
         self._clear_grid_children()
         self.online_items = list(result.items)
+        show_featured = not self.online_query and self.online_cate_id == "__featured__" and self.online_page == 1
+        self.online_featured_items = list(result.featured_items) if show_featured else []
+        featured_keys = {self._catalog_item_key(item) for item in self.online_featured_items}
+        self.online_grid_items = [
+            item for item in self.online_items if self._catalog_item_key(item) not in featured_keys
+        ]
         self.online_has_more = result.has_more
         self.online_total = result.total
         self.online_previous_button.configure(state="normal" if self.online_page > 1 else "disabled")
@@ -926,6 +946,8 @@ class App:
                 self._online_grid_message(f"{title}暂无可验证的匹配资源；桌面画廊不会用模拟数据补齐。")
             self.status.set("当前筛选没有可验证结果。")
             return
+        if self.online_featured_items:
+            self._render_featured_carousel()
         self._render_online_grid_batched(0)
         self.online_canvas.yview_moveto(0)
         if self.online_items:
@@ -945,6 +967,7 @@ class App:
                  font=("Microsoft YaHei UI", 11)).pack(pady=44)
 
     def _clear_online_grid(self) -> None:
+        self._cancel_featured_carousel()
         self._preview_generation += 1
         with self._thumbnail_futures_lock:
             for future in self._thumbnail_futures:
@@ -956,24 +979,287 @@ class App:
         self._online_image_widgets = {}
         self.online_photo_refs.clear()
         self.online_items = []
+        self.online_grid_items = []
+        self.online_featured_items = []
         self.online_selected_id = None
         if hasattr(self, "online_download_button"):
             self.online_download_button.configure(state="disabled")
             self.online_apply_button.configure(state="disabled")
+
+    def _cancel_featured_carousel(self) -> None:
+        if self._featured_carousel_after_id is not None:
+            try:
+                self.root.after_cancel(self._featured_carousel_after_id)
+            except tk.TclError:
+                pass
+        self._featured_carousel_after_id = None
+        self._featured_carousel_index = 0
+        self._featured_carousel_kind = ""
+        self._featured_carousel_frame = None
+        self._featured_main_container = None
+        self._featured_main_label = None
+        self._featured_title_label = None
+        self._featured_indicator_buttons = []
+        self._featured_theme_labels = []
+
+    def _render_featured_carousel(self) -> None:
+        if not self.online_featured_items:
+            return
+        kind = "theme" if self.online_resource_mode == "theme" else "dynamic"
+        self._featured_carousel_kind = kind
+        frame = tk.Frame(self.online_grid, bg=BG)
+        frame.grid(row=0, column=0, columnspan=3, padx=5, pady=(3, 10), sticky="ew")
+        self._featured_carousel_frame = frame
+        if kind == "theme":
+            self._build_theme_featured_carousel(frame)
+        else:
+            self._build_dynamic_featured_carousel(frame)
+        self._set_featured_carousel_index(0, select=False)
+
+    def _build_dynamic_featured_carousel(self, frame: tk.Frame) -> None:
+        container = tk.Frame(frame, bg="#111318", highlightbackground=PANEL, highlightthickness=3)
+        container.pack(anchor="center")
+        self._featured_main_container = container
+        photo = self._placeholder_thumbnail((960, 400))
+        self.online_photo_refs.append(photo)
+        picture = tk.Label(container, image=photo, bg="#111318", bd=0, cursor="hand2")
+        picture.pack()
+        picture._photo = photo
+        self._featured_main_label = picture
+        title = tk.Label(
+            picture, text="", bg="#20232a", fg="#ffffff", anchor="w",
+            font=("Microsoft YaHei UI", 11, "bold"), padx=10, pady=5,
+        )
+        title.place(x=12, y=12)
+        self._featured_title_label = title
+        tk.Label(
+            picture, text="今日热榜", bg="#20232a", fg="#ffffff",
+            font=("Microsoft YaHei UI", 14, "bold"), padx=10, pady=4,
+        ).place(x=14, rely=1.0, y=-46)
+        indicators = tk.Frame(picture, bg="#20232a")
+        indicators.place(x=132, rely=1.0, y=-45)
+        for index in range(len(self.online_featured_items)):
+            button = tk.Button(
+                indicators, text=str(index + 1), width=2,
+                command=lambda current=index: self._set_featured_carousel_index(current, select=True),
+                relief="flat", bd=0, cursor="hand2", bg="#111318", fg="#ffffff",
+                activebackground=PINK, activeforeground="#ffffff",
+                font=("Microsoft YaHei UI", 9, "bold"), padx=1, pady=1,
+            )
+            button.pack(side="left", padx=2)
+            self._featured_indicator_buttons.append(button)
+        tk.Button(
+            picture, text="‹", command=lambda: self._change_featured_carousel(-1),
+            relief="flat", bd=0, cursor="hand2", bg="#20232a", fg="#ffffff",
+            activebackground=PINK, activeforeground="#ffffff", font=("Microsoft YaHei UI", 25, "bold"),
+        ).place(x=0, rely=0.5, anchor="w", width=44, height=74)
+        tk.Button(
+            picture, text="›", command=lambda: self._change_featured_carousel(1),
+            relief="flat", bd=0, cursor="hand2", bg="#20232a", fg="#ffffff",
+            activebackground=PINK, activeforeground="#ffffff", font=("Microsoft YaHei UI", 25, "bold"),
+        ).place(relx=1.0, x=-44, rely=0.5, anchor="w", width=44, height=74)
+        picture.bind("<Button-1>", lambda _event: self._select_featured_current())
+        picture.bind("<Double-Button-1>", lambda _event: self._open_featured_current())
+
+    def _build_theme_featured_carousel(self, frame: tk.Frame) -> None:
+        tk.Label(
+            frame, text="热门主题", bg=BG, fg=TEXT,
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).pack(anchor="w", padx=10, pady=(0, 5))
+        strip = tk.Frame(frame, bg="#f2f3f6")
+        strip.pack(anchor="center")
+        sizes = ((240, 205), (500, 300), (240, 205))
+        for column, size in enumerate(sizes):
+            holder = tk.Frame(
+                strip, bg=PANEL,
+                highlightbackground=GOLD if column == 1 else PANEL,
+                highlightthickness=3 if column == 1 else 1,
+            )
+            holder.grid(row=0, column=column, padx=4, pady=4, sticky="s")
+            photo = self._placeholder_thumbnail(size)
+            self.online_photo_refs.append(photo)
+            label = tk.Label(holder, image=photo, bg=PANEL, bd=0, cursor="hand2")
+            label.pack()
+            label._photo = photo
+            self._featured_theme_labels.append(label)
+        self._featured_main_container = self._featured_theme_labels[1].master
+        self._featured_main_label = self._featured_theme_labels[1]
+        title = tk.Label(
+            self._featured_main_label, text="", bg="#20232a", fg="#ffffff", anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"), padx=9, pady=4,
+        )
+        title.place(x=9, y=9)
+        self._featured_title_label = title
+        tk.Label(
+            self._featured_main_label, text="热门主题", bg=GOLD, fg=TEXT,
+            font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3,
+        ).place(relx=1.0, x=-5, y=5, anchor="ne")
+        tk.Button(
+            strip, text="‹", command=lambda: self._change_featured_carousel(-1),
+            relief="flat", bd=0, cursor="hand2", bg="#ffffff", fg=TEXT,
+            activebackground=PINK, activeforeground="#ffffff", font=("Microsoft YaHei UI", 24, "bold"),
+        ).place(x=246, rely=0.5, anchor="center", width=44, height=44)
+        tk.Button(
+            strip, text="›", command=lambda: self._change_featured_carousel(1),
+            relief="flat", bd=0, cursor="hand2", bg="#ffffff", fg=TEXT,
+            activebackground=PINK, activeforeground="#ffffff", font=("Microsoft YaHei UI", 24, "bold"),
+        ).place(relx=1.0, x=-246, rely=0.5, anchor="center", width=44, height=44)
+        self._featured_theme_labels[0].bind("<Button-1>", lambda _event: self._change_featured_carousel(-1))
+        self._featured_theme_labels[1].bind("<Button-1>", lambda _event: self._select_featured_current())
+        self._featured_theme_labels[1].bind("<Double-Button-1>", lambda _event: self._open_featured_current())
+        self._featured_theme_labels[2].bind("<Button-1>", lambda _event: self._change_featured_carousel(1))
+
+    def _featured_current_item(self) -> CatalogItem | None:
+        if not self.online_featured_items:
+            return None
+        return self.online_featured_items[self._featured_carousel_index % len(self.online_featured_items)]
+
+    def _select_featured_current(self) -> None:
+        item = self._featured_current_item()
+        if item is not None:
+            self.select_online(item)
+
+    def _open_featured_current(self) -> None:
+        item = self._featured_current_item()
+        if item is not None:
+            self.show_online_detail(item)
+
+    def _change_featured_carousel(self, delta: int) -> None:
+        self._set_featured_carousel_index(self._featured_carousel_index + delta, select=True)
+
+    def _set_featured_carousel_index(self, index: int, *, select: bool) -> None:
+        if not self.online_featured_items:
+            return
+        self._featured_carousel_index = index % len(self.online_featured_items)
+        current = self._featured_current_item()
+        if current is None:
+            return
+        if self._featured_carousel_kind == "theme":
+            self._render_theme_featured_images()
+        elif self._featured_main_label is not None:
+            self._set_featured_label_image(self._featured_main_label, current, (960, 400))
+        if self._featured_title_label is not None:
+            self._featured_title_label.configure(text=current.title)
+        for position, button in enumerate(self._featured_indicator_buttons):
+            active = position == self._featured_carousel_index
+            button.configure(bg=PINK if active else "#111318")
+        if select:
+            self.select_online(current)
+        self._update_featured_selection()
+        self._schedule_featured_carousel()
+
+    def _render_theme_featured_images(self) -> None:
+        if len(self._featured_theme_labels) != 3 or not self.online_featured_items:
+            return
+        count = len(self.online_featured_items)
+        positions = (
+            (self._featured_carousel_index - 1) % count,
+            self._featured_carousel_index,
+            (self._featured_carousel_index + 1) % count,
+        )
+        sizes = ((240, 205), (500, 300), (240, 205))
+        for label, position, size in zip(self._featured_theme_labels, positions, sizes):
+            self._set_featured_label_image(label, self.online_featured_items[position], size)
+
+    def _set_featured_label_image(
+        self, label: tk.Label, item: CatalogItem, size: tuple[int, int]
+    ) -> None:
+        photo = self._placeholder_thumbnail(size)
+        label._photo = photo
+        label._featured_item_key = self._catalog_item_key(item)
+        label.configure(image=photo)
+        self._queue_featured_thumbnail(item, label, size, self._preview_generation)
+
+    def _queue_featured_thumbnail(
+        self, item: CatalogItem, label: tk.Label, size: tuple[int, int], generation: int
+    ) -> None:
+        item_key = self._catalog_item_key(item)
+        try:
+            future = self._thumbnail_executor.submit(self._fetch_online_thumbnail_image, item, size)
+        except RuntimeError:
+            return
+        with self._thumbnail_futures_lock:
+            self._thumbnail_futures.add(future)
+
+        def completed(done: Future) -> None:
+            with self._thumbnail_futures_lock:
+                self._thumbnail_futures.discard(done)
+            if done.cancelled():
+                return
+            try:
+                image = done.result()
+            except Exception:
+                return
+            self._safe_after(
+                lambda current=image: self._apply_featured_thumbnail(
+                    item_key, label, current, generation
+                )
+            )
+
+        future.add_done_callback(completed)
+
+    def _apply_featured_thumbnail(
+        self, item_key: str, label: tk.Label, image: Image.Image, generation: int
+    ) -> None:
+        if generation != self._preview_generation or getattr(label, "_featured_item_key", "") != item_key:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            photo = ImageTk.PhotoImage(image)
+            label._photo = photo
+            label.configure(image=photo)
+        except tk.TclError:
+            return
+
+    def _schedule_featured_carousel(self) -> None:
+        if self._featured_carousel_after_id is not None:
+            try:
+                self.root.after_cancel(self._featured_carousel_after_id)
+            except tk.TclError:
+                pass
+            self._featured_carousel_after_id = None
+        if self._featured_carousel_kind != "dynamic" or len(self.online_featured_items) < 2:
+            return
+        generation = self._preview_generation
+        self._featured_carousel_after_id = self.root.after(
+            FEATURED_CAROUSEL_INTERVAL_MS,
+            lambda: self._advance_featured_carousel(generation),
+        )
+
+    def _advance_featured_carousel(self, generation: int) -> None:
+        self._featured_carousel_after_id = None
+        if generation != self._preview_generation or self._featured_carousel_kind != "dynamic":
+            return
+        self._set_featured_carousel_index(self._featured_carousel_index + 1, select=False)
+
+    def _update_featured_selection(self) -> None:
+        if self._featured_main_container is None:
+            return
+        current = self._featured_current_item()
+        selected = current is not None and self._catalog_item_key(current) == self.online_selected_id
+        try:
+            self._featured_main_container.configure(
+                highlightbackground=GOLD if selected else PANEL,
+                highlightthickness=3 if selected else 1,
+            )
+        except tk.TclError:
+            pass
 
     def _render_online_grid_batched(self, start: int = 0, generation: int | None = None) -> None:
         generation = self._preview_generation if generation is None else generation
         if generation != self._preview_generation:
             return
         batch = 6
-        end = min(start + batch, len(self.online_items))
+        end = min(start + batch, len(self.online_grid_items))
         for index in range(start, end):
-            item = self.online_items[index]
+            item = self.online_grid_items[index]
             card = self._online_card(item)
-            card.grid(row=index // 3, column=index % 3, padx=5, pady=5, sticky="nsew")
+            row_offset = 1 if self.online_featured_items else 0
+            card.grid(row=row_offset + index // 3, column=index % 3, padx=5, pady=5, sticky="nsew")
             self.online_grid.grid_columnconfigure(index % 3, weight=1)
             self._online_card_widgets[self._catalog_item_key(item)] = card
-        if end < len(self.online_items):
+        if end < len(self.online_grid_items):
             self.root.after_idle(lambda: self._render_online_grid_batched(end, generation))
         else:
             self._update_online_borders()
@@ -1106,6 +1392,7 @@ class App:
     def select_online(self, item: CatalogItem) -> None:
         self.online_selected_id = self._catalog_item_key(item)
         self._update_online_borders()
+        self._update_featured_selection()
         if hasattr(self, "online_download_button"):
             self.online_download_button.configure(state="normal")
             self.online_apply_button.configure(state="normal")
