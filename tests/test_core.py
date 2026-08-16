@@ -325,6 +325,30 @@ class CoreTests(unittest.TestCase):
                 "https://img-baofun.zhhainiao.com/pcwallpaper_ugc/live/protected.mp4"
             )
 
+    def test_only_dynamic_scene_items_receive_baked_component_warning(self):
+        scene = CatalogItem("1", "场景", "https://example.test/scene.jpg", resource_kind="dynamic", format="scene")
+        video = CatalogItem("2", "视频", "https://example.test/video.jpg", resource_kind="dynamic", format="MP4")
+        static = CatalogItem("3", "静态", "https://example.test/static.jpg", resource_kind="static", format="scene")
+        self.assertTrue(app.scene_components_may_be_baked(scene))
+        self.assertFalse(app.scene_components_may_be_baked(video))
+        self.assertFalse(app.scene_components_may_be_baked(static))
+
+    def test_scene_conversion_confirmation_defaults_to_safe_cancel(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            scene = CatalogItem(
+                "1", "场景", "https://example.test/scene.jpg", resource_kind="dynamic", format="scene"
+            )
+            with patch.object(app.messagebox, "askokcancel", return_value=False) as confirm:
+                self.assertFalse(window._confirm_scene_conversion(scene))
+            self.assertEqual(confirm.call_args.kwargs["default"], "cancel")
+            self.assertIn("已取消转换", window.status.get())
+        finally:
+            root.destroy()
+
     def test_unverified_synthetic_category_is_not_faked(self):
         source = YuanqiResourceSource(lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"})
         with self.assertRaises(CatalogError):

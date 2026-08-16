@@ -67,6 +67,12 @@ OFFICIAL_CATALOG_URL = "https://bizhi.cheetahfun.com/"
 OFFICIAL_FEATURED_SOURCE = "元气官网首页公开展示"
 LEGACY_FEATURED_SOURCES = {"元气官网公开精选", "元气官网精选", OFFICIAL_FEATURED_SOURCE}
 YUANQI_CACHE_SOURCE = "本机元气静态缓存（已独立复制）"
+SCENE_COMPONENT_WARNING = (
+    "这是元气 scene 场景主题。它的 preview_video 可能已经把时间、天气等组件合成进每一帧；"
+    "转换成 JPEG 后，这些内容会变成不会更新的固定文字。\n\n"
+    "Windows 原生壁纸不能承载元气场景组件，桌面画廊也无法从已合成画面可靠还原被遮挡的背景。\n\n"
+    "继续转换会原样保留画面中的组件。是否仍然继续？"
+)
 DEFAULT_YUANQI_CACHE_DIRS = (
     Path.home() / "AppData" / "Roaming" / "kdesk" / "data" / "wallpaper" / "img",
     Path("G:/元气壁纸缓存/img"),
@@ -111,6 +117,10 @@ def wallpaper_matches_query(item: Wallpaper, query: str) -> bool:
         return True
     haystack = " ".join((item.title, item.source, Path(item.path).stem)).casefold()
     return all(term in haystack for term in terms)
+
+
+def scene_components_may_be_baked(item: CatalogItem) -> bool:
+    return item.resource_kind == "dynamic" and item.format.strip().casefold() == "scene"
 
 
 def load_config() -> dict:
@@ -921,7 +931,10 @@ class App:
         name = tk.Label(picture, text=item.title, bg="#20232a", fg="#ffffff", anchor="w",
                         font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=3)
         name.place(x=8, y=8)
-        meta_text = "动态预览转静态" if item.resource_kind == "dynamic" else (item.category_name or "精选")
+        if scene_components_may_be_baked(item):
+            meta_text = "场景转静态 · 组件可能固化"
+        else:
+            meta_text = "动态预览转静态" if item.resource_kind == "dynamic" else (item.category_name or "精选")
         if item.resolution:
             meta_text += " · " + item.resolution
         meta = tk.Label(card, text=meta_text, bg=PANEL, fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 8))
@@ -1061,6 +1074,17 @@ class App:
                 anchor="w",
                 font=("Microsoft YaHei UI", 9, "bold"),
             ).pack(fill="x", padx=16, pady=(0, 3))
+        if scene_components_may_be_baked(item):
+            tk.Label(
+                dialog,
+                text="注意：scene 预览可能已合成时间/天气组件；转成 Windows 原生 JPEG 后不会更新，转换前请检查画面。",
+                bg="#fff1d6",
+                fg="#8a4b00",
+                anchor="w",
+                font=("Microsoft YaHei UI", 9, "bold"),
+                padx=8,
+                pady=5,
+            ).pack(fill="x", padx=16, pady=(0, 3))
         image_label = tk.Label(dialog, bg="#d8dce6"); image_label.pack(fill="both", expand=True, padx=16, pady=6)
         actions = tk.Frame(dialog, bg=PANEL); actions.pack(fill="x", padx=16, pady=(6, 14))
         download_label = "转换到本地图库" if item.resource_kind == "dynamic" else "下载到本地图库"
@@ -1104,7 +1128,23 @@ class App:
             return
         self._download_item_to_library(item)
 
+    def _confirm_scene_conversion(self, item: CatalogItem) -> bool:
+        if not scene_components_may_be_baked(item):
+            return True
+        accepted = messagebox.askokcancel(
+            "场景组件会变成固定画面",
+            SCENE_COMPONENT_WARNING,
+            icon="warning",
+            default="cancel",
+            parent=self.root,
+        )
+        if not accepted:
+            self.status.set("已取消转换：scene 预览中的时间/天气组件可能会固化。")
+        return accepted
+
     def _download_item_to_library(self, item: CatalogItem) -> None:
+        if not self._confirm_scene_conversion(item):
+            return
         if item.resource_kind == "dynamic":
             self.status.set(f"正在下载动态预览并从 5 个时间点选择高清帧：{item.title}")
         else:
@@ -1154,6 +1194,8 @@ class App:
         self._apply_item(item)
 
     def _apply_item(self, item: CatalogItem) -> None:
+        if not self._confirm_scene_conversion(item):
+            return
         if item.resource_kind == "dynamic":
             self.status.set(f"正在转换动态预览并交给 Windows 原生壁纸接口：{item.title}")
         else:
