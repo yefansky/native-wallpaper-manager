@@ -1,7 +1,6 @@
 """原生壁纸管理器：图库式浏览，且只使用 Windows 原生壁纸接口。"""
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import io
 import json
@@ -14,7 +13,6 @@ import threading
 import urllib.parse
 import urllib.request
 import uuid
-import winreg
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import requests
@@ -51,6 +49,12 @@ from yuanqi_auth import (
 )
 from session_store import clear_session, load_session, save_session
 from wechat_login import WechatQrLoginBackend, log_diag, sha8
+from wallpaper_backend import (
+    WallpaperApplyResult,
+    current_native_wallpaper,
+    same_windows_path,
+    set_native_wallpaper,
+)
 
 APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
 WALLPAPER_DIR = APP_DIR / "wallpapers"
@@ -104,9 +108,6 @@ OFFICIAL_STATIC_CATEGORIES = (
     ("汽车", "https://bizhi.cheetahfun.com/dn/c8j/"),
     ("其他", "https://bizhi.cheetahfun.com/dn/c11j/"),
 )
-SPI_SETDESKWALLPAPER = 20
-SPIF_UPDATEINIFILE = 0x01
-SPIF_SENDCHANGE = 0x02
 LOCAL_PAGE_SIZE = 12
 FEATURED_CAROUSEL_INTERVAL_MS = 5000
 BG, PANEL, TEXT, MUTED, GOLD, PINK, LINE = "#ffffff", "#ffffff", "#171b27", "#7d8493", "#ffc400", "#ff4f8b", "#edf0f4"
@@ -194,16 +195,6 @@ def normalize_config(config: dict) -> dict:
     normalized.setdefault("interval_minutes", 0)
     normalized.setdefault("last_applied", "")
     return normalized
-
-
-def current_native_wallpaper() -> Path:
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as key:
-        value, _kind = winreg.QueryValueEx(key, "WallPaper")
-    return Path(value)
-
-
-def same_windows_path(left: Path, right: Path) -> bool:
-    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 
 def file_digest(path: Path) -> str:
@@ -404,21 +395,6 @@ def copy_yuanqi_cache_images(candidates: list[Path], existing_paths: list[Path])
     return imported
 
 
-def set_native_wallpaper(path: Path) -> None:
-    path = path.resolve()
-    if path.suffix.lower() not in IMAGE_EXTENSIONS:
-        raise ValueError("Windows 原生壁纸仅支持 BMP/JPG/PNG 图片")
-    if not path.is_file() or path.stat().st_size == 0:
-        raise ValueError("壁纸文件不存在或为空")
-    if not ctypes.windll.user32.SystemParametersInfoW(
-        SPI_SETDESKWALLPAPER, 0, str(path), SPIF_UPDATEINIFILE
-    ):
-        raise ctypes.WinError()
-    applied = current_native_wallpaper()
-    if not same_windows_path(applied, path):
-        raise OSError(f"Windows 未确认壁纸变更，当前仍为：{applied}")
-
-
 def download_static_image(url: str, title: str, source: str) -> Wallpaper:
     parsed = urllib.parse.urlparse(url)
     suffix = Path(parsed.path).suffix.lower()
@@ -497,6 +473,8 @@ class App:
         self._featured_indicator_buttons: list[tk.Button] = []
         self._featured_theme_labels: list[tk.Label] = []
         self._loading_online = False
+        self._apply_operation_in_progress = False
+        self._apply_operation_id: str | None = None
         self._ui_queue: queue.Queue = queue.Queue()
         self.root.after(80, self._poll_ui_queue)
         threading.Thread(target=self._try_restore_session, daemon=True).start()
@@ -982,8 +960,14 @@ class App:
                 callback = self._ui_queue.get_nowait()
                 try:
                     callback()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # UI 回调失败不能把业务状态永久留在“进行中”。
+                    log_diag(f"ui callback failed: {exc!r}")
+                    try:
+                        self._restore_apply_controls()
+                        self.status.set(f"界面收尾异常，操作状态已复位：{exc}")
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         try:
@@ -1618,20 +1602,23 @@ class App:
     def selected_online(self) -> CatalogItem | None:
         return next((item for item in self.online_items if self._catalog_item_key(item) == self.online_selected_id), None)
 
+    @staticmethod
+    def _online_action_texts(item: CatalogItem) -> tuple[str, str]:
+        if item.resource_kind == "theme":
+            return "转换为原生主题", "转换并应用主题"
+        if item.resource_kind == "dynamic":
+            return "转换到本地", "转换并设为壁纸"
+        return "下载到本地", "下载并设为壁纸"
+
     def select_online(self, item: CatalogItem) -> None:
         self.online_selected_id = self._catalog_item_key(item)
         self._update_online_borders()
         self._update_featured_selection()
         if hasattr(self, "online_download_button"):
-            self.online_download_button.configure(state="normal")
-            self.online_apply_button.configure(state="normal")
-            if item.resource_kind == "theme":
-                self.online_download_button.configure(text="转换为原生主题")
-                self.online_apply_button.configure(text="转换并应用主题")
-            else:
-                dynamic = item.resource_kind == "dynamic"
-                self.online_download_button.configure(text="转换到本地" if dynamic else "下载到本地")
-                self.online_apply_button.configure(text="转换并设为壁纸" if dynamic else "下载并设为壁纸")
+            download_text, apply_text = self._online_action_texts(item)
+            state = "disabled" if self._apply_operation_in_progress else "normal"
+            self.online_download_button.configure(state=state, text=download_text)
+            self.online_apply_button.configure(state=state, text=apply_text)
         if item.resource_kind == "theme":
             if theme_has_live_component_risk(item) and not has_direct_clean_video_source(item):
                 suffix = "；当前只有私有资源包和带组件预览，为避免固定假时钟，不允许转换应用。"
@@ -1852,8 +1839,13 @@ class App:
         self._apply_item(item)
 
     def _apply_item(self, item: CatalogItem) -> None:
+        if self._apply_operation_in_progress:
+            return
         if not self._confirm_scene_conversion(item):
             return
+        operation_id = uuid.uuid4().hex
+        self._apply_operation_id = operation_id
+        self._set_apply_controls_busy("online", "正在准备……")
         if item.resource_kind == "theme":
             self.status.set(f"正在转换并交给 Windows 原生主题机制：{item.title}")
         elif item.resource_kind == "dynamic":
@@ -1870,40 +1862,66 @@ class App:
                 target.write_bytes(data)
                 if not is_valid_static_image(target):
                     raise CatalogError("生成文件没有通过静态图片校验")
-                set_native_wallpaper(target)
                 if item.resource_kind in {"dynamic", "theme"}:
                     summary = source_adapter.conversion_summary(item.id)
                     if item.resource_kind == "theme":
-                        theme_path = self._write_single_wallpaper_theme(target, item.title, item.id)
-                        os.startfile(theme_path)
                         source_name = f"元气电脑主题转原生 · {summary}" if summary else "元气电脑主题转原生"
                     else:
                         source_name = f"元气动态预览转静态 · {summary}" if summary else "元气动态预览转静态"
                 else:
                     source_name = "元气联网下载"
                 wallpaper = Wallpaper(uuid.uuid4().hex, str(target), item.title, source=source_name)
-                self._safe_after(lambda: self._finish_online_apply(wallpaper, None))
-            except (CatalogError, OSError, ValueError) as exc:
+                self._safe_after(
+                    lambda: self._finish_online_asset_for_apply(operation_id, item, wallpaper, None)
+                )
+            except Exception as exc:
                 if target is not None:
                     target.unlink(missing_ok=True)
-                self._safe_after(lambda error=exc: self._finish_online_apply(None, error))
+                self._safe_after(
+                    lambda error=exc: self._finish_online_asset_for_apply(
+                        operation_id, item, None, error
+                    )
+                )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_online_apply(self, wallpaper: Wallpaper | None, error: Exception | None) -> None:
-        if error:
-            self.status.set(f"应用失败：{error}")
-            messagebox.showerror("应用失败", str(error))
+    def _finish_online_asset_for_apply(
+        self,
+        operation_id: str,
+        item: CatalogItem,
+        wallpaper: Wallpaper | None,
+        error: Exception | None,
+    ) -> None:
+        if operation_id != self._apply_operation_id:
             return
-        wallpaper, _added = self._add_or_merge_wallpaper(wallpaper, prefer_candidate_path=True)
+        if error:
+            self._apply_operation_id = None
+            self._restore_apply_controls()
+            self.status.set(f"资源准备失败：{error}")
+            messagebox.showerror("下载或转换失败", str(error))
+            return
+        if wallpaper is None:
+            raise RuntimeError("资源准备完成但没有可用的本地壁纸")
+
+        # 先将资源提交到本地图库，再请求 Windows 应用。即使系统应用失败，
+        # 下载/转换成果仍是稳定资产，不能被当作临时文件回滚。
+        wallpaper, _added = self._add_or_merge_wallpaper(wallpaper)
         self.selected_id = wallpaper.id
-        self.config["last_applied"] = wallpaper.id
         self.refresh()
         conversion = wallpaper.source if wallpaper.source.startswith(("元气动态预览转静态", "元气电脑主题转原生")) else ""
         applied_kind = "Windows 原生主题" if wallpaper.source.startswith("元气电脑主题转原生") else "Windows 原生壁纸"
-        self.status.set(f"已应用为 {applied_kind}：{wallpaper.title}" + (f"（{conversion}）" if conversion else ""))
-        detail = f"\n转换信息：{conversion}" if conversion else ""
-        messagebox.showinfo("应用成功", f"“{wallpaper.title}”已由 Windows 注册表复核应用成功。{detail}")
+        theme_path = None
+        if item.resource_kind == "theme":
+            theme_path = self._write_single_wallpaper_theme(Path(wallpaper.path), item.title, item.id)
+        self.status.set(f"资源已进入本地图库，正在交给 Windows 应用：{wallpaper.title}")
+        self._start_wallpaper_apply(
+            wallpaper,
+            origin="online",
+            applied_kind=applied_kind,
+            conversion=conversion,
+            operation_id=operation_id,
+            theme_path=theme_path,
+        )
 
     def _launch_wechat_login_window(self) -> dict | None:
         """以独立子进程拉起微信登录窗，读取其 stdout 返回的会话结构。"""
@@ -2169,7 +2187,7 @@ class App:
         item = self.selected()
         if item:
             self.favorite_action.configure(text="★  取消收藏" if item.favorite else "☆  收藏")
-            self.apply_button.configure(state="normal")
+            self.apply_button.configure(state="disabled" if self._apply_operation_in_progress else "normal")
             self.status.set(f"已选择：{item.title} · {item.source}")
         else:
             self.apply_button.configure(state="disabled")
@@ -2348,32 +2366,142 @@ class App:
             self.refresh(); self.status.set("5 张官网公开样图已是最新。" if not added else f"已同步 {added} 张官网公开样图；这不代表账号资源已接入。")
         except (OSError, ValueError) as exc: messagebox.showerror("同步失败", str(exc))
 
+    def _set_apply_controls_busy(self, origin: str, text: str = "正在应用……") -> None:
+        """进入唯一的壁纸应用事务，阻止其他入口并发应用。"""
+
+        self._apply_operation_in_progress = True
+        if hasattr(self, "apply_button"):
+            self.apply_button.configure(state="disabled")
+        if hasattr(self, "online_download_button"):
+            self.online_download_button.configure(state="disabled")
+            self.online_apply_button.configure(state="disabled")
+        if origin == "local" and hasattr(self, "apply_button"):
+            self.apply_button.configure(text=text)
+        elif origin == "online" and hasattr(self, "online_apply_button"):
+            self.online_apply_button.configure(text=text)
+
+    def _restore_apply_controls(self) -> None:
+        """无论成功、失败还是 UI 回调异常，都将应用状态收敛到稳定态。"""
+
+        self._apply_operation_in_progress = False
+        if hasattr(self, "apply_button"):
+            self.apply_button.configure(
+                state="normal" if self.selected() else "disabled",
+                text="设为壁纸",
+            )
+        if hasattr(self, "online_download_button"):
+            item = self.selected_online()
+            if item is None:
+                self.online_download_button.configure(state="disabled")
+                self.online_apply_button.configure(state="disabled")
+            else:
+                download_text, apply_text = self._online_action_texts(item)
+                self.online_download_button.configure(state="normal", text=download_text)
+                self.online_apply_button.configure(state="normal", text=apply_text)
+
+    def _start_wallpaper_apply(
+        self,
+        wallpaper: Wallpaper,
+        *,
+        origin: str,
+        applied_kind: str = "Windows 原生壁纸",
+        conversion: str = "",
+        operation_id: str | None = None,
+        theme_path: Path | None = None,
+    ) -> None:
+        """本地页与资源页共用的唯一系统应用入口。"""
+
+        if self._apply_operation_in_progress and operation_id is None:
+            return
+        operation_id = operation_id or uuid.uuid4().hex
+        self._apply_operation_id = operation_id
+        self._set_apply_controls_busy(origin)
+        self.status.set(f"正在交给 Windows 应用：{wallpaper.title}")
+
+        def work() -> None:
+            result: WallpaperApplyResult | None = None
+            error: Exception | None = None
+            try:
+                result = set_native_wallpaper(Path(wallpaper.path))
+            except Exception as exc:
+                error = exc
+            self._safe_after(
+                lambda: self._finish_wallpaper_apply(
+                    operation_id,
+                    wallpaper,
+                    result,
+                    error,
+                    applied_kind,
+                    conversion,
+                    theme_path,
+                )
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_wallpaper_apply(
+        self,
+        operation_id: str,
+        wallpaper: Wallpaper,
+        result: WallpaperApplyResult | None,
+        error: Exception | None,
+        applied_kind: str,
+        conversion: str,
+        theme_path: Path | None,
+    ) -> None:
+        if operation_id != self._apply_operation_id:
+            return
+
+        # 先复位控件，后做持久化、主题启动和弹窗；后续任何异常都不会卡住按钮。
+        self._apply_operation_id = None
+        self._restore_apply_controls()
+        if error is not None:
+            self.status.set(f"Windows 应用失败：{wallpaper.title} · {error}")
+            messagebox.showerror("应用失败", str(error))
+            return
+        if result is None:
+            raise RuntimeError("Windows 应用操作没有返回结果")
+
+        self.config["last_applied"] = wallpaper.id
+        persistence_error: OSError | None = None
+        try:
+            self.persist()
+        except OSError as exc:
+            persistence_error = exc
+
+        theme_error: OSError | None = None
+        if theme_path is not None:
+            try:
+                os.startfile(theme_path)
+            except OSError as exc:
+                theme_error = exc
+
+        detail = f"（{conversion}）" if conversion else ""
+        if result.confirmed:
+            self.status.set(f"已由 Windows 系统接口确认应用为 {applied_kind}：{wallpaper.title}{detail}")
+            messagebox.showinfo("应用成功", f"“{wallpaper.title}”已应用为 {applied_kind}。")
+        else:
+            observed = str(result.observed_path) if result.observed_path else "暂未返回路径"
+            self.status.set(
+                f"Windows 已接受应用请求，但限时内尚未确认：{wallpaper.title}"
+            )
+            messagebox.showwarning(
+                "Windows 已接受，正在确认",
+                f"“{wallpaper.title}”的设置请求已成功提交。\n\n"
+                f"当前系统读到：{observed}\n"
+                "资源已保留在本地图库；如果桌面随后被换回，请检查其他壁纸软件。",
+            )
+
+        if persistence_error is not None:
+            messagebox.showwarning("应用记录未保存", f"壁纸已交给 Windows，但本地记录保存失败：{persistence_error}")
+        if theme_error is not None:
+            messagebox.showwarning("主题启动失败", f"静态壁纸已应用，但 Windows 主题文件未能启动：{theme_error}")
+
     def apply_selected(self) -> None:
         item = self.selected()
         if not item:
             return
-        item_id, item_title, item_path = item.id, item.title, Path(item.path)
-        self.apply_button.configure(state="disabled", text="正在应用……")
-        self.status.set(f"正在交给 Windows 应用：{item_title}")
-
-        def work() -> None:
-            try:
-                set_native_wallpaper(item_path)
-                self._safe_after(lambda: finish(None))
-            except (OSError, ValueError) as exc:
-                self._safe_after(lambda: finish(exc))
-
-        def finish(error: Exception | None) -> None:
-            self.apply_button.configure(state="normal", text="应用为壁纸")
-            if error:
-                self.status.set(f"Windows 未确认壁纸变更：{item_title}")
-                messagebox.showerror("应用失败", str(error))
-                return
-            self.config["last_applied"] = item_id
-            self.persist()
-            self.status.set(f"已由 Windows 注册表复核应用成功：{item_title}")
-
-        threading.Thread(target=work, daemon=True).start()
+        self._start_wallpaper_apply(item, origin="local")
 
     def toggle_selected_favorite(self) -> None:
         item = self.selected()
@@ -2421,6 +2549,9 @@ class App:
             self.timer = threading.Timer(minutes * 60, self.apply_next); self.timer.daemon = True; self.timer.start()
 
     def apply_next(self) -> None:
+        if self._apply_operation_in_progress:
+            self.schedule_next()
+            return
         favorites = [item for item in self.items if item.favorite]
         if favorites:
             last = self.config.get("last_applied"); index = next((i for i, item in enumerate(favorites) if item.id == last), -1)

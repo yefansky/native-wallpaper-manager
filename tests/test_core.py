@@ -6,13 +6,14 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 import native_wallpaper as app
 import session_store as session_store
+import wallpaper_backend as backend
 from product import SingleInstance, autostart_command, autostart_enabled, set_autostart
 from catalog import (
     CatalogError,
@@ -895,8 +896,184 @@ class CoreTests(unittest.TestCase):
                 self.assertFalse(original.exists())
                 self.assertTrue(applied.exists())
 
+    def test_wallpaper_backend_broadcasts_and_waits_for_system_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "target.jpg"
+            Image.new("RGB", (80, 50), "#88aaff").save(target)
+            calls = []
+            observed = iter((Path(temp) / "old.jpg", target.resolve()))
+            now = [0.0]
+
+            def fake_spi(action, ui_param, value, flags):
+                calls.append((action, ui_param, value, flags))
+                return True
+
+            result = backend.set_native_wallpaper(
+                target,
+                confirm_timeout=1.0,
+                confirm_interval=0.1,
+                current_reader=lambda: next(observed),
+                system_parameters_info=fake_spi,
+                monotonic=lambda: now[0],
+                sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            )
+
+            self.assertTrue(result.confirmed)
+            self.assertEqual(result.attempts, 2)
+            self.assertEqual(calls[0][0], backend.SPI_SETDESKWALLPAPER)
+            self.assertEqual(
+                calls[0][3],
+                backend.SPIF_UPDATEINIFILE | backend.SPIF_SENDCHANGE,
+            )
+
+    def test_wallpaper_backend_returns_accepted_unconfirmed_without_false_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "target.jpg"
+            old = Path(temp) / "old.jpg"
+            Image.new("RGB", (80, 50), "#88aaff").save(target)
+            now = [0.0]
+
+            result = backend.set_native_wallpaper(
+                target,
+                confirm_timeout=0.2,
+                confirm_interval=0.1,
+                current_reader=lambda: old,
+                system_parameters_info=lambda *_args: True,
+                monotonic=lambda: now[0],
+                sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            )
+
+            self.assertFalse(result.confirmed)
+            self.assertEqual(result.observed_path, old)
+            self.assertGreaterEqual(result.attempts, 2)
+
+    def test_current_wallpaper_prefers_windows_system_api_over_stale_registry(self):
+        system_path = Path(r"C:\wallpapers\system-current.jpg")
+        with patch.object(
+            backend, "_current_wallpaper_from_system_api", return_value=system_path
+        ), patch.object(
+            backend,
+            "_current_wallpaper_from_registry",
+            side_effect=AssertionError("registry fallback must not replace system API state"),
+        ):
+            self.assertEqual(backend.current_native_wallpaper(), system_path)
+
+    def test_wallpaper_apply_completion_resets_button_before_persistence_work(self):
+        class FakeButton:
+            def __init__(self):
+                self.options = {}
+
+            def configure(self, **options):
+                self.options.update(options)
+
+        class FakeStatus:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wallpaper.jpg"
+            Image.new("RGB", (80, 50), "#88aaff").save(path)
+            wallpaper = app.Wallpaper("wallpaper-id", str(path), "收尾测试")
+            harness = object.__new__(app.App)
+            harness.items = [wallpaper]
+            harness.selected_id = wallpaper.id
+            harness.online_items = []
+            harness.online_selected_id = None
+            harness.apply_button = FakeButton()
+            harness.online_download_button = FakeButton()
+            harness.online_apply_button = FakeButton()
+            harness._apply_operation_in_progress = True
+            harness._apply_operation_id = "operation"
+            harness.config = {}
+            harness.status = FakeStatus()
+            harness.persist = MagicMock(side_effect=OSError("磁盘写入失败"))
+            result = backend.WallpaperApplyResult(path.resolve(), True, path.resolve(), 1)
+
+            with patch.object(app.messagebox, "showinfo"), patch.object(app.messagebox, "showwarning"):
+                harness._finish_wallpaper_apply(
+                    "operation", wallpaper, result, None, "Windows 原生壁纸", "", None
+                )
+
+            self.assertFalse(harness._apply_operation_in_progress)
+            self.assertEqual(harness.apply_button.options["state"], "normal")
+            self.assertEqual(harness.apply_button.options["text"], "设为壁纸")
+            self.assertTrue(path.exists())
+
+    def test_online_apply_commits_asset_before_starting_shared_system_apply(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "downloaded.jpg"
+            Image.new("RGB", (80, 50), "#88aaff").save(path)
+            wallpaper = app.Wallpaper("wallpaper-id", str(path), "联网资产", source="元气联网下载")
+            item = CatalogItem("catalog-id", "联网资产", "https://example.invalid/preview.jpg")
+            harness = object.__new__(app.App)
+            harness._apply_operation_id = "operation"
+            harness._apply_operation_in_progress = True
+            harness.selected_id = None
+            harness.status = MagicMock()
+            harness._add_or_merge_wallpaper = MagicMock(return_value=(wallpaper, True))
+            harness.refresh = MagicMock()
+            harness._start_wallpaper_apply = MagicMock()
+
+            harness._finish_online_asset_for_apply(
+                "operation", item, wallpaper, None
+            )
+
+            harness._add_or_merge_wallpaper.assert_called_once_with(wallpaper)
+            harness._start_wallpaper_apply.assert_called_once()
+            self.assertEqual(harness.selected_id, wallpaper.id)
+            self.assertTrue(path.exists())
+
+    def test_system_apply_failure_resets_controls_and_keeps_local_asset(self):
+        class FakeButton:
+            def __init__(self):
+                self.options = {}
+
+            def configure(self, **options):
+                self.options.update(options)
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wallpaper.jpg"
+            Image.new("RGB", (80, 50), "#88aaff").save(path)
+            wallpaper = app.Wallpaper("wallpaper-id", str(path), "保留测试")
+            harness = object.__new__(app.App)
+            harness.items = [wallpaper]
+            harness.selected_id = wallpaper.id
+            harness.online_items = []
+            harness.online_selected_id = None
+            harness.apply_button = FakeButton()
+            harness.online_download_button = FakeButton()
+            harness.online_apply_button = FakeButton()
+            harness._apply_operation_in_progress = True
+            harness._apply_operation_id = "operation"
+            harness.config = {}
+            harness.status = MagicMock()
+
+            with patch.object(app.messagebox, "showerror"):
+                harness._finish_wallpaper_apply(
+                    "operation",
+                    wallpaper,
+                    None,
+                    OSError("Windows API 拒绝"),
+                    "Windows 原生壁纸",
+                    "",
+                    None,
+                )
+
+            self.assertFalse(harness._apply_operation_in_progress)
+            self.assertEqual(harness.apply_button.options["state"], "normal")
+            self.assertTrue(path.exists())
+
     def test_no_desktop_overlay_or_explorer_injection(self):
-        source = (Path(__file__).parents[1] / "app" / "native_wallpaper.py").read_text(encoding="utf-8")
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                Path(__file__).parents[1] / "app" / "native_wallpaper.py",
+                Path(__file__).parents[1] / "app" / "wallpaper_backend.py",
+            )
+        )
         forbidden = ("WorkerW", "SetParent", "Progman", "FindWindowW", "ShowWindow", "SHELLDLL_DefView")
         for symbol in forbidden:
             self.assertNotIn(symbol, source)
