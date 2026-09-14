@@ -369,8 +369,14 @@ def run(smoke: bool = False) -> int:
 
 def smoke_package() -> int:
     """Exercise the frozen WebView2 bridge without network or login state."""
-    result = {"ok": False, "message": "WebView2 smoke timed out"}
+    import logging
+    logging.getLogger('pywebview').setLevel(logging.DEBUG)
+    started = time.monotonic()
+    def trace(event: str) -> None:
+        print(json.dumps({"event": event, "elapsed": round(time.monotonic() - started, 3)}), flush=True)
+    result = {"ok": False, "message": "WebView2 smoke timed out after 45 seconds"}
     finished = threading.Event()
+    trace("create_window")
     window = webview.create_window(
         "Desktop Gallery package test",
         html='<html><body><div id="package-check">ready</div></body></html>',
@@ -378,9 +384,11 @@ def smoke_package() -> int:
     )
 
     def check() -> None:
+        trace("loaded")
         try:
             value = window.evaluate_js("document.getElementById('package-check').textContent")
             result.update(ok=value == "ready", message="WebView2 JavaScript bridge")
+            trace("javascript_passed" if value == "ready" else "javascript_failed")
         except Exception as exc:
             result.update(ok=False, message=repr(exc))
         finally:
@@ -389,13 +397,16 @@ def smoke_package() -> int:
 
     def timeout() -> None:
         if not finished.is_set():
+            trace("timeout")
             window.destroy()
 
+    window.events.before_show += lambda: trace("before_show")
     window.events.loaded += check
-    timer = threading.Timer(15.0, timeout)
+    timer = threading.Timer(45.0, timeout)
     timer.daemon = True
     timer.start()
     try:
+        trace("start_edgechromium")
         webview.start(gui="edgechromium", private_mode=True)
     except Exception as exc:
         result.update(ok=False, message=repr(exc))

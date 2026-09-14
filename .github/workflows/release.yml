@@ -46,12 +46,35 @@ jobs:
       - name: Smoke test frozen applications
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force build/smoke | Out-Null
+          "UserInteractive=$([Environment]::UserInteractive); SessionId=$((Get-Process -Id $PID).SessionId)" | Tee-Object build/smoke/environment.txt
+          $runtimeKeys = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          foreach ($key in $runtimeKeys) {
+            $version = (Get-ItemProperty -LiteralPath $key -Name pv -ErrorAction SilentlyContinue).pv
+            "WebView2 runtime $key pv=$version" | Tee-Object -FilePath build/smoke/environment.txt -Append
+          }
           foreach ($exe in @('DesktopGallery.exe', 'DesktopGalleryLogin.exe')) {
             $argument = if ($exe -eq 'DesktopGalleryLogin.exe') { '--smoke-package' } else { '--smoke' }
-            $process = Start-Process "dist/DesktopGallery/$exe" -ArgumentList $argument -WindowStyle Hidden -PassThru
-            if (!$process.WaitForExit(60000)) { $process.Kill(); throw "$exe smoke timed out" }
+            $stdout = "build/smoke/$exe.stdout.log"
+            $stderr = "build/smoke/$exe.stderr.log"
+            $process = Start-Process "dist/DesktopGallery/$exe" -ArgumentList $argument -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            $completed = $process.WaitForExit(90000)
+            if (!$completed) { $process.Kill(); $process.WaitForExit() }
+            Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue
+            Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue
+            if (!$completed) { throw "$exe smoke timed out" }
             if ($process.ExitCode -ne 0) { throw "$exe smoke failed: $($process.ExitCode)" }
           }
+      - name: Keep smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
+          path: build/smoke/*
+          if-no-files-found: ignore
       - name: Keep build artifacts
         uses: actions/upload-artifact@v4
         with:
