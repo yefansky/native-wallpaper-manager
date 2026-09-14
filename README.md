@@ -38,6 +38,11 @@
 
 ## 运行与安装
 
+- **安装版（推荐）**：从 GitHub Releases 下载 `DesktopGallery-<版本>-Setup.exe`。无需安装 Python，默认在当前用户目录安装，并创建桌面和开始菜单启动图标。
+- **后续更新**：安装版启动后自动检查 GitHub Releases，也可在“我的 → 检查更新”手动检查；确认下载后先校验完整安装包，再询问是否更新并重启。设置、收藏、登录态和壁纸库继续使用原数据目录，卸载也保留数据。
+- **私有仓库访问**：当前发布仓库是私有的。首次使用需在“我的 → 更新访问设置”填入对该仓库有 `Contents: Read-only` 权限的 GitHub fine-grained token；令牌绑定当前 Windows 用户加密保存。安装包不包含开发者令牌，未配置时不能自动读取私有 Release。
+- **发布**：推送到远端 `main` 触发 GitHub Actions 构建和发布；本地 commit 不触发。构建、版本规则、依赖和首次发布步骤见 [发布说明](docs/releasing.md)。
+
 - **运行**：双击 `run.bat`（首次运行会自动安装依赖，用 `pythonw` 无控制台启动）。
 - **动态转静态依赖**：需要 `ffmpeg.exe` 与 `ffprobe.exe`。程序会查找 PATH 和 WinGet 的 Gyan.FFmpeg 安装目录；找不到或预览低于 1280×720 时会明确拒绝转换，不会改用模糊缩略图。
 - **安装**：双击 `install.bat` → 安装依赖、创建开始菜单/桌面快捷方式、开启开机自启。

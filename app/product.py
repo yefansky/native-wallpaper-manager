@@ -24,6 +24,8 @@ def _pythonw() -> str:
 
 
 def autostart_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
     script = str(Path(__file__).resolve().parents[1] / "app" / "native_wallpaper.py")
     return f'"{_pythonw()}" "{script}"'
 
@@ -63,6 +65,9 @@ def notify_already_running() -> None:
 
 class SingleInstance:
     def __init__(self, name: str = MUTEX_NAME):
+        ctypes.windll.kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        ctypes.windll.kernel32.CreateMutexW.restype = ctypes.c_void_p
+        ctypes.windll.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         self._handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
         self.already_running = ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
 

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import urllib.parse
 import urllib.request
 import uuid
@@ -19,7 +20,7 @@ import requests
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 import pystray
@@ -35,6 +36,8 @@ from catalog import (
     theme_preview_has_live_component_risk,
 )
 from product import SingleInstance, autostart_enabled, set_autostart
+from app_version import VERSION
+from updater import GitHubUpdater, load_update_token, save_update_token, launch_installer
 from yuanqi_auth import (
     AuthPhase,
     BRIDGE_METHODS,
@@ -418,8 +421,9 @@ def download_static_image(url: str, title: str, source: str) -> Wallpaper:
 
 
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, *, smoke: bool = False):
         self.root = root
+        self._update_busy = False
         self.root.title("桌面画廊 · 原生壁纸管理器")
         self.root.geometry("1180x760")
         self.root.minsize(1000, 640)
@@ -477,7 +481,8 @@ class App:
         self._apply_operation_id: str | None = None
         self._ui_queue: queue.Queue = queue.Queue()
         self.root.after(80, self._poll_ui_queue)
-        threading.Thread(target=self._try_restore_session, daemon=True).start()
+        if not smoke:
+            threading.Thread(target=self._try_restore_session, daemon=True).start()
         loaded_items = [Wallpaper(**item) for item in self.config.get("items", []) if Path(item["path"]).exists()]
         try:
             native_wallpaper = current_native_wallpaper()
@@ -522,8 +527,84 @@ class App:
                 + (f"，并清理 {removed_duplicates} 个重复文件。" if removed_duplicates else "。")
             )
         self.schedule_next()
-        self._init_tray()
+        if not smoke:
+            self._init_tray()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if getattr(sys, "frozen", False) and not smoke:
+            if autostart_enabled():
+                set_autostart(True)  # Migrate a previous source-install startup command.
+            self.root.after(5000, lambda: self.check_for_updates(False))
+
+    def check_for_updates(self, manual: bool = True) -> None:
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self.update_status.set("正在检查 GitHub 更新……")
+        def work():
+            try:
+                updater = GitHubUpdater(load_update_token())
+                release = updater.check()
+                self._safe_after(lambda: self._update_checked(updater, release, manual))
+            except Exception as exc:
+                # Exception text is deliberately not logged: a transport may contain URLs.
+                self._safe_after(lambda: self._update_failed("无法检查更新：请检查网络、Release 是否已发布，以及更新访问设置。", manual))
+        threading.Thread(target=work, daemon=True, name="github-update-check").start()
+
+    def _update_failed(self, text: str, manual: bool = True) -> None:
+        self._update_busy = False
+        self.update_status.set(text)
+        if manual:
+            messagebox.showerror("应用更新", text, parent=self.root)
+
+    def _update_checked(self, updater, release, manual: bool) -> None:
+        self._update_busy = False
+        if release is None:
+            self.update_status.set(f"当前版本 {VERSION}，已是最新版本。")
+            if manual:
+                messagebox.showinfo("应用更新", "当前已是最新版本。", parent=self.root)
+            return
+        self.update_status.set(f"发现新版本 {release.version}。")
+        if not messagebox.askyesno("发现新版本", f"当前版本 {VERSION}，新版本 {release.version}。\n是否下载更新？下载期间可以继续使用。", parent=self.root):
+            return
+        self._update_busy = True
+        self.update_status.set("正在下载并校验安装包……")
+        def work():
+            try:
+                path = updater.download(release)
+                self._safe_after(lambda: self._update_downloaded(path))
+            except Exception:
+                self._safe_after(lambda: self._update_failed("下载或完整性校验失败，当前版本未修改。请稍后重试。"))
+        threading.Thread(target=work, daemon=True, name="github-update-download").start()
+
+    def _update_downloaded(self, path) -> None:
+        self._update_busy = False
+        self.update_status.set("安装包已下载并通过 SHA-256 校验。")
+        if not getattr(sys, "frozen", False):
+            os.startfile(str(path.parent))
+            messagebox.showinfo("安装包已就绪", "当前为源码运行模式，请退出程序后手动运行已下载的安装包。", parent=self.root)
+            return
+        if not messagebox.askyesno("更新并重启", "安装包已校验。现在退出桌面画廊、安装更新并重新启动？\n壁纸库、收藏和设置会保留。", parent=self.root):
+            return
+        if (self._apply_operation_in_progress or self._loading_online or not self._ui_queue.empty()
+                or any(t.name == "gallery-operation" and t.is_alive() for t in threading.enumerate())):
+            messagebox.showinfo("稍后更新", "当前操作尚未完成，请完成后再次检查更新。", parent=self.root)
+            return
+        try:
+            self.persist()
+            launch_installer(path)
+        except Exception:
+            self._update_failed("无法启动安装程序，当前版本未修改。请重试。")
+            return
+        self._quit_app()
+
+    def configure_update_access(self) -> None:
+        token = simpledialog.askstring("更新访问设置", "私有 GitHub 仓库需有该仓库 Contents 只读权限的令牌。\n仅在当前 Windows 用户下加密保存，不会随安装包分发。\n输入留空可清除；取消保留当前配置。", show="*", parent=self.root)
+        if token is not None:
+            try:
+                save_update_token(token)
+                self.update_status.set("更新访问设置已保存，可点击检查更新。")
+            except Exception:
+                messagebox.showerror("更新访问设置", "令牌格式无效或无法加密保存。", parent=self.root)
 
     def button(self, parent, text, command, *, accent=False, width=None, compact=False):
         return tk.Button(parent, text=text, command=command, width=width, relief="flat", cursor="hand2",
@@ -945,6 +1026,8 @@ class App:
         self._safe_after(self._quit_app)
 
     def _quit_app(self) -> None:
+        if self.timer:
+            self.timer.cancel()
         self._cancel_featured_carousel()
         self._thumbnail_executor.shutdown(wait=False, cancel_futures=True)
         try:
@@ -1812,7 +1895,7 @@ class App:
                     target.unlink(missing_ok=True)
                 self._safe_after(lambda error=exc: self._finish_online_download(None, error))
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="gallery-operation").start()
 
     def _finish_online_download(self, wallpaper: Wallpaper | None, error: Exception | None) -> None:
         if error:
@@ -1883,7 +1966,7 @@ class App:
                     )
                 )
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="gallery-operation").start()
 
     def _finish_online_asset_for_apply(
         self,
@@ -1927,8 +2010,10 @@ class App:
         """以独立子进程拉起微信登录窗，读取其 stdout 返回的会话结构。"""
         project_root = Path(__file__).resolve().parents[1]
         command = [sys.executable, str(project_root / "app" / "wechat_login_window.py")]
+        if getattr(sys, "frozen", False):
+            command = [str(Path(sys.executable).with_name("DesktopGalleryLogin.exe"))]
         try:
-            proc = subprocess.run(command, capture_output=True, text=True, timeout=720, encoding="utf-8")
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=720, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.status.set(f"微信登录窗口异常：{exc}")
             return None
@@ -1949,7 +2034,7 @@ class App:
             result = self._launch_wechat_login_window()
             self._safe_after(lambda: self._finish_wechat_login(result))
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="gallery-operation").start()
         messagebox.showinfo("微信扫码登录", "即将弹出官方微信登录窗口。\n请用微信扫描二维码并在手机端确认；确认后本客户端会自动读取会话并校验。")
 
     def _finish_wechat_login(self, result: dict | None) -> None:
@@ -2067,7 +2152,7 @@ class App:
         self.mine_summary.pack(fill="x")
 
         system = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=22, pady=16)
-        system.pack(fill="x", pady=(0, 12))
+        system.pack(fill="x", pady=(0, 12), before=self.mine_summary)
         tk.Label(system, text="系统", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
         tk.Label(system, text="关闭窗口时最小化到系统托盘；右键托盘图标可恢复或退出。", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(4, 8))
@@ -2076,6 +2161,13 @@ class App:
         self.autostart_button.pack(side="left")
         tk.Label(row, text="随系统启动", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 10)).pack(side="left", padx=8)
         self.refresh_autostart_button()
+        update_row = tk.Frame(system, bg=PANEL)
+        update_row.pack(anchor="w", pady=(14, 0))
+        self.button(update_row, "检查更新", self.check_for_updates).pack(side="left")
+        self.button(update_row, "更新访问设置", self.configure_update_access).pack(side="left", padx=8)
+        self.update_status = tk.StringVar(value=f"当前版本 {VERSION}；安装版启动时自动检查 GitHub 更新。")
+        tk.Label(system, textvariable=self.update_status, bg=PANEL, fg=MUTED, wraplength=900,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=8)
         return page
 
     def refresh_autostart_button(self) -> None:
@@ -2330,7 +2422,7 @@ class App:
             self.cache_status.configure(text=f"发现 {len(candidates)} 张有效静态图，本次新增 {len(added_items)} 张")
             self.status.set(f"已把 {len(added_items)} 张元气静态缓存独立复制到本地资料库。")
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="gallery-operation").start()
 
     def import_detected_yuanqi_cache(self) -> None:
         self.import_yuanqi_cache_roots(list(DEFAULT_YUANQI_CACHE_DIRS))
@@ -2437,7 +2529,7 @@ class App:
                 )
             )
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="gallery-operation").start()
 
     def _finish_wallpaper_apply(
         self,
@@ -2562,6 +2654,19 @@ class App:
 
 
 if __name__ == "__main__":
+    if "--smoke" in sys.argv[1:]:
+        # Packaging QA uses a throwaway library, no mutex, login, tray or startup writes.
+        with tempfile.TemporaryDirectory(prefix="DesktopGallery-smoke-") as smoke_dir:
+            APP_DIR = Path(smoke_dir)
+            WALLPAPER_DIR = APP_DIR / "wallpapers"
+            CONFIG_PATH = APP_DIR / "config.json"
+            THEME_DIR = APP_DIR / "themes"
+            root = tk.Tk()
+            root.withdraw()
+            smoke_app = App(root, smoke=True)
+            root.update()
+            smoke_app._quit_app()
+        raise SystemExit(0)
     instance = SingleInstance()
     if instance.already_running:
         from product import notify_already_running

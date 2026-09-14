@@ -1,0 +1,80 @@
+name: Windows release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          $compilerDir = Join-Path $env:RUNNER_TEMP 'InnoSetup6'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $setup
+          $signature = Get-AuthenticodeSignature $setup
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Pyrsys B.V.') { throw 'Inno Setup signature validation failed' }
+          $process = Start-Process $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/NOICONS', ('/DIR="' + $compilerDir + '"')) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Inno Setup installation failed' }
+          "INNO_ISCC=$compilerDir\ISCC.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Assign release version
+        shell: pwsh
+        run: |
+          $version = "0.1.${{ github.run_number }}"
+          $source = Get-Content app/app_version.py -Raw
+          [regex]::Replace($source, '(?m)^VERSION\s*=.*$', "VERSION = '$version'") | Set-Content app/app_version.py -Encoding utf8
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test
+        run: python -m unittest discover -s tests
+      - name: Build Windows installer
+        shell: pwsh
+        run: ./packaging/build.ps1 -Iscc $env:INNO_ISCC
+      - name: Smoke test frozen applications
+        shell: pwsh
+        run: |
+          foreach ($exe in @('DesktopGallery.exe', 'DesktopGalleryLogin.exe')) {
+            $argument = if ($exe -eq 'DesktopGalleryLogin.exe') { '--smoke-package' } else { '--smoke' }
+            $process = Start-Process "dist/DesktopGallery/$exe" -ArgumentList $argument -WindowStyle Hidden -PassThru
+            if (!$process.WaitForExit(60000)) { $process.Kill(); throw "$exe smoke timed out" }
+            if ($process.ExitCode -ne 0) { throw "$exe smoke failed: $($process.ExitCode)" }
+          }
+      - name: Keep build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesktopGallery-${{ env.APP_VERSION }}
+          path: dist/installer/*
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:APP_VERSION"
+          $existing = gh release view $tag --json isDraft 2>$null | ConvertFrom-Json
+          if ($existing -and !$existing.isDraft) {
+            Write-Host 'This release is already published; preserve its immutable assets.'
+            exit 0
+          }
+          if (!$existing) {
+            gh release create $tag --draft --target '${{ github.sha }}' --title "Desktop Gallery $env:APP_VERSION" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
+          }
+          gh release upload $tag "dist/installer/DesktopGallery-$env:APP_VERSION-Setup.exe" "dist/installer/DesktopGallery-$env:APP_VERSION-Setup.exe.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          $releaseId = gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq .id
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve draft release' }
+          gh api --method PATCH "repos/${{ github.repository }}/releases/$releaseId" -F draft=false -f make_latest=legacy --silent
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

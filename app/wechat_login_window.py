@@ -367,5 +367,45 @@ def run(smoke: bool = False) -> int:
     return 0 if verified else 1
 
 
+def smoke_package() -> int:
+    """Exercise the frozen WebView2 bridge without network or login state."""
+    result = {"ok": False, "message": "WebView2 smoke timed out"}
+    finished = threading.Event()
+    window = webview.create_window(
+        "Desktop Gallery package test",
+        html='<html><body><div id="package-check">ready</div></body></html>',
+        hidden=True,
+    )
+
+    def check() -> None:
+        try:
+            value = window.evaluate_js("document.getElementById('package-check').textContent")
+            result.update(ok=value == "ready", message="WebView2 JavaScript bridge")
+        except Exception as exc:
+            result.update(ok=False, message=repr(exc))
+        finally:
+            finished.set()
+            window.destroy()
+
+    def timeout() -> None:
+        if not finished.is_set():
+            window.destroy()
+
+    window.events.loaded += check
+    timer = threading.Timer(15.0, timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        webview.start(gui="edgechromium", private_mode=True)
+    except Exception as exc:
+        result.update(ok=False, message=repr(exc))
+    finally:
+        timer.cancel()
+    print(json.dumps(result, ensure_ascii=True), flush=True)
+    return 0 if result["ok"] else 1
+
+
 if __name__ == "__main__":
+    if "--smoke-package" in sys.argv[1:]:
+        sys.exit(smoke_package())
     sys.exit(run(smoke="--smoke" in sys.argv[1:]))
