@@ -97,7 +97,7 @@ jobs:
           }
           gh release upload $tag "dist/installer/DesktopGallery-$env:APP_VERSION-Setup.exe" "dist/installer/DesktopGallery-$env:APP_VERSION-Setup.exe.sha256" --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          $releaseId = gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq .id
+          $releaseApiUrl = gh release view $tag --json apiUrl --jq .apiUrl
           if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve draft release' }
-          gh api --method PATCH "repos/${{ github.repository }}/releases/$releaseId" -F draft=false -f make_latest=legacy --silent
+          gh api --method PATCH $releaseApiUrl -F draft=false -f make_latest=legacy --silent
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
