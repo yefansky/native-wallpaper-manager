@@ -280,22 +280,23 @@ def cleanup_redundant_wallpaper_files(
     """仅删除资料库目录内、已无记录引用且不是当前桌面的精确重复副本。"""
     try:
         library_root = (wallpaper_dir or WALLPAPER_DIR).resolve()
-    except OSError:
+        referenced = {
+            os.path.normcase(str(path.resolve())) for path in referenced_paths
+        }
+        current_key = (
+            os.path.normcase(str(current_wallpaper.resolve())) if current_wallpaper is not None else ""
+        )
+    except (OSError, RuntimeError):
+        # An unresolved protected path must never be dropped before deleting files.
         return 0
-    referenced = {
-        os.path.normcase(os.path.abspath(path)) for path in referenced_paths
-    }
-    current_key = (
-        os.path.normcase(os.path.abspath(current_wallpaper)) if current_wallpaper is not None else ""
-    )
     removed = 0
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
             resolved.relative_to(library_root)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             continue
-        path_key = os.path.normcase(os.path.abspath(resolved))
+        path_key = os.path.normcase(str(resolved))
         if (
             path_key in referenced
             or path_key == current_key
@@ -324,24 +325,24 @@ def find_unreferenced_duplicate_files(
     known_hashes: set[str] = set(referenced_hashes or ())
     for path in referenced_paths:
         try:
-            referenced_keys.add(os.path.normcase(os.path.abspath(path.resolve())))
+            referenced_keys.add(os.path.normcase(str(path.resolve())))
             if referenced_hashes is None:
                 known_hashes.add(file_digest(path))
-        except OSError:
-            continue
+        except (OSError, RuntimeError):
+            return []
     duplicates: list[Path] = []
     try:
         candidates = list(library_root.iterdir())
     except OSError:
         return []
     for candidate in candidates:
-        candidate_key = os.path.normcase(os.path.abspath(candidate))
-        if candidate_key in referenced_keys or not is_valid_static_image(candidate):
-            continue
         try:
+            candidate_key = os.path.normcase(str(candidate.resolve()))
+            if candidate_key in referenced_keys or not is_valid_static_image(candidate):
+                continue
             if file_digest(candidate) in known_hashes:
                 duplicates.append(candidate)
-        except OSError:
+        except (OSError, RuntimeError):
             continue
     return duplicates
 

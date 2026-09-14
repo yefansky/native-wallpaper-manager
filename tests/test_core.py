@@ -862,6 +862,83 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(kept.exists())
             self.assertTrue(outside.exists())
 
+    def test_duplicate_discovery_normalizes_candidate_short_path_aliases(self):
+        # Deterministically model Windows resolve expanding RUNNER~1, even when
+        # the local volume has 8.3 filename creation disabled.
+        with tempfile.TemporaryDirectory() as temp:
+            library = Path(temp)
+            kept, duplicate = library / "kept.jpg", library / "duplicate.jpg"
+            for path in (kept, duplicate):
+                Image.new("RGB", (40, 30), "#336699").save(path)
+            original_resolve = Path.resolve
+            def expand_alias(path, *args, **kwargs):
+                resolved = original_resolve(path, *args, **kwargs)
+                if path.parent == library:
+                    return resolved.parent / "expanded-long-directory" / path.name
+                return resolved
+            with patch.object(Path, "resolve", expand_alias):
+                self.assertEqual(app.find_unreferenced_duplicate_files([kept], library), [duplicate])
+
+    def test_duplicate_cleanup_preserves_referenced_and_current_path_aliases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            library = Path(temp)
+            kept, current, duplicate = (library / name for name in ("kept.jpg", "current.jpg", "duplicate.jpg"))
+            for path in (kept, current, duplicate):
+                Image.new("RGB", (40, 30), "#336699").save(path)
+            kept_alias = library / "KEPT~1.JPG"
+            current_alias = library / "CURREN~1.JPG"
+            original_resolve = Path.resolve
+            aliases = {kept_alias: kept, current_alias: current}
+            def expand_alias(path, *args, **kwargs):
+                return original_resolve(aliases.get(path, path), *args, **kwargs)
+            with patch.object(Path, "resolve", expand_alias):
+                removed = app.cleanup_redundant_wallpaper_files(
+                    [kept, current, duplicate], [kept_alias], current_alias, library)
+            self.assertEqual(removed, 1)
+            self.assertTrue(kept.exists())
+            self.assertTrue(current.exists())
+            self.assertFalse(duplicate.exists())
+
+    def test_duplicate_cleanup_with_real_windows_short_path_when_available(self):
+        import ctypes
+        with tempfile.TemporaryDirectory(prefix="gallery-long-path-regression-") as temp:
+            library = Path(temp) / "wallpaper library long directory"
+            library.mkdir()
+            kept, current, duplicate = (library / name for name in ("kept.jpg", "current.jpg", "duplicate.jpg"))
+            for path in (kept, current, duplicate):
+                Image.new("RGB", (40, 30), "#336699").save(path)
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = ctypes.windll.kernel32.GetShortPathNameW(str(library), buffer, len(buffer))
+            if not length or length >= len(buffer) or buffer.value.casefold() == str(library).casefold():
+                self.skipTest("8.3 aliases unavailable; deterministic alias regressions remain active")
+            short_library = Path(buffer.value)
+            detected = app.find_unreferenced_duplicate_files([kept, current], short_library)
+            self.assertEqual(detected, [short_library / duplicate.name])
+            removed = app.cleanup_redundant_wallpaper_files(
+                list(short_library.iterdir()), [kept], current, short_library)
+            self.assertEqual(removed, 1)
+            self.assertTrue(kept.exists())
+            self.assertTrue(current.exists())
+            self.assertFalse(duplicate.exists())
+
+    def test_duplicate_cleanup_aborts_when_protected_path_cannot_resolve(self):
+        with tempfile.TemporaryDirectory() as temp:
+            library = Path(temp)
+            kept, duplicate = library / "kept.jpg", library / "duplicate.jpg"
+            for path in (kept, duplicate):
+                Image.new("RGB", (40, 30), "#336699").save(path)
+            original_resolve = Path.resolve
+            def unavailable(path, *args, **kwargs):
+                if path == kept:
+                    raise OSError("Cannot resolve protected path")
+                return original_resolve(path, *args, **kwargs)
+            with patch.object(Path, "resolve", unavailable):
+                self.assertEqual(app.find_unreferenced_duplicate_files([kept], library), [])
+                self.assertEqual(app.cleanup_redundant_wallpaper_files([duplicate], [kept], wallpaper_dir=library), 0)
+                self.assertEqual(app.cleanup_redundant_wallpaper_files([duplicate], [], kept, library), 0)
+            self.assertTrue(kept.exists())
+            self.assertTrue(duplicate.exists())
+
     def test_repeated_download_reuses_record_and_apply_replaces_owned_path(self):
         with tempfile.TemporaryDirectory() as temp:
             library = Path(temp)
