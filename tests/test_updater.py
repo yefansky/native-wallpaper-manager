@@ -47,6 +47,24 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(updater.UpdateError):
             self.client.check()
 
+    def test_anonymous_check_succeeds_without_authorization(self):
+        # 公开仓库匿名读取 Release：空 token 也能检查，且请求头不带 Authorization。
+        client = updater.GitHubUpdater('')
+        client.session = Mock()
+        name = 'DesktopGallery-0.1.12-Setup.exe'
+        release = updater.Release('0.1.12', name, client.api + '/assets/1', client.api + '/assets/2', 7)
+        payload = {'tag_name': 'v0.1.12', 'assets': [
+            {'name': name, 'url': release.installer_url, 'size': 7, 'state': 'uploaded'},
+            {'name': name + '.sha256', 'url': release.checksum_url, 'state': 'uploaded'}]}
+        client.session.get.return_value = response(json.dumps(payload).encode())
+
+        found = client.check('0.1.11')
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.version, '0.1.12')
+        self.assertEqual(client.session.get.call_args.args[0], client.api + '/latest')
+        self.assertNotIn('Authorization', client.session.get.call_args.kwargs['headers'])
+
     def test_credentials_stripped_on_cdn_redirect(self):
         self.client.session.get.side_effect = [
             response(status=302, location='https://release-assets.githubusercontent.com/file?signature=value'), response(b'body')]

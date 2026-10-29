@@ -13,7 +13,7 @@ CI 版本为 `0.1.<github.run_number>`，只写构建工作区的 `app/app_versi
 
 主程序 `DesktopGallery.exe` 为无控制台 GUI；微信登录独立为 `DesktopGalleryLogin.exe` 控制台进程，供主进程隐藏窗口并捕获标准输出。两者共用 `_internal` 依赖，发布时必须包含整个 PyInstaller 目录。登录需要系统 WebView2 Runtime；动态转换仍需要原应用要求的外部 ffmpeg/ffprobe，这次打包没有附带第三方视频工具。
 
-仓库当前是私有仓库。客户端访问私有 Release 需要用户自己配置对本仓库具有 Contents 只读权限的 GitHub token；禁止把开发者 token 写入代码、构建产物或 Release。CI 使用 GitHub 自动注入的 `GITHUB_TOKEN`，只在发布步骤使用，不打入应用。用户没有仓库权限时无法通过私有 Release 获得更新。
+当前发行仓库公开，客户端匿名读取 Release 即可检查并下载更新。CI 仍使用 GitHub 自动注入的 `GITHUB_TOKEN`，仅用于发布步骤，不打入应用；禁止把开发者 token 写入代码、构建产物或 Release。仅当更新源是私有镜像或 Fork 时，才需要用户自配对该仓库具有 Contents 只读权限的 token。
 
 ## 本地构建
 

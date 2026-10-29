@@ -105,7 +105,7 @@ class GitHubUpdater:
                 status = response.status_code
                 response.close()
                 if status in (401, 403, 404):
-                    raise UpdateError('尚无可用 Release，或私有仓库需要有效的 Contents 只读令牌；请在“更新访问设置”中配置。')
+                    raise UpdateError('尚无可用 Release，或更新源访问受限；请稍后重试。')
                 raise UpdateError(f'GitHub 更新服务暂不可用（HTTP {status}）。')
             return response
         raise UpdateError('GitHub 下载重定向次数过多。')

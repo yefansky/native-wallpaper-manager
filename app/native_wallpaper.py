@@ -550,7 +550,7 @@ class App:
                 self._safe_after(lambda: self._update_checked(updater, release, manual))
             except Exception as exc:
                 # Exception text is deliberately not logged: a transport may contain URLs.
-                self._safe_after(lambda: self._update_failed("无法检查更新：请检查网络、Release 是否已发布，以及更新访问设置。", manual))
+                self._safe_after(lambda: self._update_failed("无法检查更新：请检查网络或 Release 是否已发布。", manual))
         threading.Thread(target=work, daemon=True, name="github-update-check").start()
 
     def _update_failed(self, text: str, manual: bool = True) -> None:
@@ -601,13 +601,13 @@ class App:
         self._quit_app()
 
     def configure_update_access(self) -> None:
-        token = simpledialog.askstring("更新访问设置", "私有 GitHub 仓库需有该仓库 Contents 只读权限的令牌。\n仅在当前 Windows 用户下加密保存，不会随安装包分发。\n输入留空可清除；取消保留当前配置。", show="*", parent=self.root)
+        token = simpledialog.askstring("更新源设置", "公开仓库无需配置。仅当更新源是私有镜像或 Fork 时，才需要对该仓库有 Contents 只读权限的令牌；仅在当前 Windows 用户下加密保存，不会随安装包分发。输入留空可清除；取消保留当前配置。", show="*", parent=self.root)
         if token is not None:
             try:
                 save_update_token(token)
-                self.update_status.set("更新访问设置已保存，可点击检查更新。")
+                self.update_status.set("更新源设置已保存，可点击检查更新。")
             except Exception:
-                messagebox.showerror("更新访问设置", "令牌格式无效或无法加密保存。", parent=self.root)
+                messagebox.showerror("更新源设置", "令牌格式无效或无法加密保存。", parent=self.root)
 
     def button(self, parent, text, command, *, accent=False, width=None, compact=False):
         return tk.Button(parent, text=text, command=command, width=width, relief="flat", cursor="hand2",
@@ -2176,7 +2176,7 @@ class App:
         update_row = tk.Frame(system, bg=PANEL)
         update_row.pack(anchor="w", pady=(14, 0))
         self.button(update_row, "检查更新", self.check_for_updates).pack(side="left")
-        self.button(update_row, "更新访问设置", self.configure_update_access).pack(side="left", padx=8)
+        self.button(update_row, "更新源设置", self.configure_update_access).pack(side="left", padx=8)
         self.update_status = tk.StringVar(value=f"当前版本 {VERSION}；安装版启动时自动检查 GitHub 更新。")
         tk.Label(system, textvariable=self.update_status, bg=PANEL, fg=MUTED, wraplength=900,
                  font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=8)
