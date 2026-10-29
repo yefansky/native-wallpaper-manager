@@ -198,6 +198,41 @@ def theme_preview_has_live_component_risk(item: CatalogItem) -> bool:
     return has_named_risk or has_private_component
 
 
+def scene_components_may_be_baked(item: CatalogItem) -> bool:
+    """scene 预览可能已经把时间/天气等组件烘焙进每一帧。"""
+    return item.resource_kind in {"dynamic", "theme"} and item.format.strip().casefold() == "scene"
+
+
+def preview_fallback_allowed(item: CatalogItem) -> bool:
+    """唯一权威：正式画面不可用时是否允许回退带组件风险的 preview_video。
+
+    非 scene 动态壁纸安全回退；scene 动态壁纸只在没有正式源时保持既有确认后回退；
+    电脑主题按是否识别出实时组件判断。规则按资源自身语义判定，与由哪个源实例处理无关。
+    """
+    if item.resource_kind == "theme":
+        return not theme_preview_has_live_component_risk(item)
+    if scene_components_may_be_baked(item):
+        # 有正式源时硬拦，保留 33070dc 的假时钟安全边界；无正式源时由 UI 默认取消式确认。
+        return not bool(item.source_video_url)
+    return True
+
+
+def preview_fallback_blocked_message(item: CatalogItem, source_error: object = "") -> str:
+    """按资源类型生成硬拦文案，避免把动态壁纸误称电脑主题。"""
+    if item.resource_kind == "theme":
+        detail = "该电脑主题的正式画面是暂不支持的 CWP3/资源包"
+    else:
+        detail = "该动态壁纸的正式画面无法按标准视频解码"
+    message = (
+        f"{detail}；为避免把时间、天气等组件烘焙成不会更新的固定画面，"
+        "已禁止自动回退 preview_video。"
+    )
+    reason = str(source_error or "").strip()
+    if reason:
+        message += f" 正式资源失败原因：{reason}。"
+    return message
+
+
 class YuanqiResourceSource:
     """使用自研扫码会话访问元气 PC 静态壁纸资源。"""
 
@@ -668,12 +703,13 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
         return self._page_from_list_payload(self._post(DYNAMIC_LIST_URL, body), page)
 
     def _source_conversion_allowed(self, item: CatalogItem) -> bool:
-        return bool(item.source_video_url)
+        # 主题接口的 video 字段常是 ZIP 资源包或真 CWP3，而不是 XOR 包装的 MP4。
+        # 两个源共用同一跳过规则；是否能解码仍由转换器权威判断。
+        path = urlparse(item.source_video_url).path.casefold()
+        return bool(path) and not path.endswith((".zip", ".cwp"))
 
     def _preview_fallback_allowed(self, item: CatalogItem) -> bool:
-        # 有正式源视频时，若解码失败（可能是 CWP3 私有容器）不能回退 preview_video，
-        # 否则会把时间/天气 HUD 烘焙成不会更新的固定假时钟。
-        return not bool(item.source_video_url)
+        return preview_fallback_allowed(item)
 
     def download_original(self, item_id: str) -> bytes:
         item = self._items_by_id.get(str(item_id))
@@ -706,10 +742,7 @@ class YuanqiDynamicResourceSource(YuanqiResourceSource):
                 raise CatalogError(str(exc)) from exc
 
         if converted is None and item.preview_video_url and not self._preview_fallback_allowed(item):
-            raise CatalogError(
-                "该电脑主题的正式画面是暂不支持的 CWP3/资源包；为避免把时间、天气等组件"
-                "烘焙成不会更新的固定画面，已禁止自动回退 preview_video。"
-            ) from source_error
+            raise CatalogError(preview_fallback_blocked_message(item, source_error)) from source_error
 
         if converted is None:
             assert source_error is not None
@@ -761,16 +794,6 @@ class YuanqiThemeResourceSource(YuanqiDynamicResourceSource):
         self._featured_pages.clear()
         self._featured_cursors = {1: ""}
         self._carousel_items = None
-
-    def _source_conversion_allowed(self, item: CatalogItem) -> bool:
-        # 主题接口的 video 字段常是 ZIP 资源包或真 CWP3，而不是 XOR 包装的 MP4。
-        # 现有转换器只处理能还原成标准视频的流；提前跳过可避免每次白下载几十 MiB。
-        path = urlparse(item.source_video_url).path.casefold()
-        return bool(path) and not path.endswith((".zip", ".cwp"))
-
-    def _preview_fallback_allowed(self, item: CatalogItem) -> bool:
-        # 普通主题仍可降级；明确带实时组件的主题绝不能静默烘焙预览 HUD。
-        return not theme_preview_has_live_component_risk(item)
 
     def refresh_categories(self) -> tuple[CatalogCategory, ...]:
         if self._server_categories is not None:

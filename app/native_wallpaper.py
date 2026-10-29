@@ -33,6 +33,7 @@ from catalog import (
     YuanqiDynamicResourceSource,
     YuanqiResourceSource,
     YuanqiThemeResourceSource,
+    scene_components_may_be_baked,
     theme_preview_has_live_component_risk,
 )
 from product import SingleInstance, autostart_enabled, set_autostart
@@ -77,11 +78,16 @@ OFFICIAL_FEATURED_SOURCE = "元气官网首页公开展示"
 LEGACY_FEATURED_SOURCES = {"元气官网公开精选", "元气官网精选", OFFICIAL_FEATURED_SOURCE}
 YUANQI_CACHE_SOURCE = "本机元气静态缓存（已独立复制）"
 SCENE_COMPONENT_WARNING = (
-    "这是元气 scene 场景主题。桌面画廊会先尝试可验证的正式画面；若正式资源无法按标准视频解码，"
-    "会回退 preview_video，而预览可能已经把时间、天气等组件合成进每一帧。转换成 JPEG 后，"
+    "这是元气 scene 场景主题，当前没有可验证的正式画面，只能使用 preview_video 预览。"
+    "预览可能已经把时间、天气等组件合成进每一帧。转换成 JPEG 后，"
     "这些内容会变成不会更新的固定文字。\n\n"
     "Windows 原生壁纸不能承载元气场景组件，桌面画廊也无法从已合成画面可靠还原被遮挡的背景。\n\n"
     "继续转换会原样保留画面中的组件。是否仍然继续？"
+)
+SCENE_PRIVATE_SOURCE_WARNING = (
+    "该 scene 场景主题的正式画面是暂不支持的私有容器（.cwp/.zip 等），当前无法按标准视频解码。"
+    "而 preview_video 可能已经固化了时间、天气等 scene 组件，转换后会变成不会更新的固定画面。\n\n"
+    "为避免生成固定假时钟，桌面画廊不会回退预览视频，已阻止本次转换。"
 )
 THEME_CONVERSION_WARNING = (
     "元气电脑主题可能包含动态壁纸、时钟/天气/系统信息、鼠标特效、任务栏和窗口皮肤。"
@@ -136,10 +142,6 @@ def wallpaper_matches_query(item: Wallpaper, query: str) -> bool:
         return True
     haystack = " ".join((item.title, item.source, Path(item.path).stem)).casefold()
     return all(term in haystack for term in terms)
-
-
-def scene_components_may_be_baked(item: CatalogItem) -> bool:
-    return item.resource_kind in {"dynamic", "theme"} and item.format.strip().casefold() == "scene"
 
 
 def theme_has_live_component_risk(item: CatalogItem) -> bool:
@@ -1838,11 +1840,20 @@ class App:
             return accepted
         if not scene_components_may_be_baked(item):
             return True
+        if item.source_video_url and not has_direct_clean_video_source(item):
+            # 数据层会硬拦；UI 提前阻止，避免用户先确认、下载几十 MiB 后才报错。
+            messagebox.showwarning(
+                "该场景无法安全转为静态壁纸",
+                SCENE_PRIVATE_SOURCE_WARNING,
+                parent=self.root,
+            )
+            self.status.set("已阻止转换：该 scene 主题的正式画面是暂不支持的私有容器，场景预览可能固化组件。")
+            return False
         if has_direct_clean_video_source(item):
-            # 用解密后的干净高清源视频，时间/天气 HUD 不会被烘焙进静态画面。
+            # 用解密后的高清源视频；解码失败会中止，不会回退带组件预览。
             accepted = messagebox.askokcancel(
-                "使用干净源视频转换",
-                "已使用解密后的高清源视频生成静态画面，时间/天气 HUD 不会出现。\n\n继续转换？",
+                "使用高清源视频转换",
+                "将优先尝试可解码的高清源视频；若解码失败会中止，不会回退带组件预览。\n\n继续转换？",
                 icon="question",
                 default="ok",
                 parent=self.root,

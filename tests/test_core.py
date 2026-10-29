@@ -621,6 +621,48 @@ class CoreTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_scene_with_private_container_source_is_blocked_before_download(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            scene = CatalogItem(
+                "scene-cwp", "场景", "https://example.test/scene.jpg",
+                resource_kind="dynamic", format="scene",
+                source_video_url="https://img-baofun.zhhainiao.com/scene.cwp",
+                preview_video_url="https://img-baofun.zhhainiao.com/scene_preview.mp4",
+            )
+            with patch.object(app.messagebox, "showwarning") as warning, patch.object(
+                app.messagebox, "askokcancel"
+            ) as confirm:
+                self.assertFalse(window._confirm_scene_conversion(scene))
+            warning.assert_called_once()
+            confirm.assert_not_called()
+            self.assertIn("已阻止转换", window.status.get())
+        finally:
+            root.destroy()
+
+    def test_scene_with_direct_video_source_confirms_decode_attempt(self):
+        root = app.tk.Tk()
+        root.withdraw()
+        try:
+            with patch.object(app.App, "_try_restore_session"), patch.object(app.App, "_init_tray"):
+                window = app.App(root)
+            scene = CatalogItem(
+                "scene-mp4", "场景", "https://example.test/scene.jpg",
+                resource_kind="dynamic", format="scene",
+                source_video_url="https://img-baofun.zhhainiao.com/scene.mp4",
+                preview_video_url="https://img-baofun.zhhainiao.com/scene_preview.mp4",
+            )
+            with patch.object(app.messagebox, "askokcancel", return_value=True) as confirm:
+                self.assertTrue(window._confirm_scene_conversion(scene))
+            self.assertEqual(confirm.call_args.kwargs["default"], "ok")
+            self.assertIn("不会回退带组件预览", confirm.call_args.args[1])
+            self.assertNotIn("HUD 不会出现", confirm.call_args.args[1])
+        finally:
+            root.destroy()
+
     def test_theme_detail_keeps_both_actions_inside_dialog(self):
         root = app.tk.Tk()
         root.withdraw()
@@ -1470,9 +1512,9 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(item.preview_url.endswith("frame.jpg"))
         self.assertTrue(item.preview_video_url.endswith("frame_preview.mp4"))
 
-    def test_dynamic_source_failure_does_not_fall_back_to_preview_video(self):
-        converted = ConvertedFrame(b"preview-jpeg", 1920, 1080, 3.3, 100.0, 5)
-        converter = unittest.mock.Mock(side_effect=[ConversionUnavailable("not mp4"), converted])
+    def test_dynamic_source_failure_falls_back_to_preview_video(self):
+        preview = ConvertedFrame(b"preview-jpeg", 1920, 1080, 3.3, 100.0, 5)
+        converter = unittest.mock.Mock(side_effect=[ConversionUnavailable("not mp4"), preview])
         source = YuanqiDynamicResourceSource(
             lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
         )
@@ -1484,11 +1526,90 @@ class CoreTests(unittest.TestCase):
         )
         source._items_by_id[item.id] = item
 
-        # 源视频解码失败（可能是 CWP3 私有容器）时，不能回退带 HUD 的 preview_video。
-        from catalog import CatalogError
-        with self.assertRaises(CatalogError):
+        # 非 scene 动态壁纸没有实时组件风险，正式源失败后应回退标准预览视频。
+        self.assertEqual(source.download_original(item.id), b"preview-jpeg")
+        self.assertEqual(len(converter.call_args_list), 2)
+        self.assertEqual(converter.call_args_list[1].args[0], item.preview_video_url)
+        self.assertFalse(converter.call_args_list[1].kwargs["decrypt"])
+        self.assertTrue(source.conversion_summary(item.id).startswith("预览回退 · "))
+
+    def test_scene_dynamic_source_failure_is_blocked_without_preview_fallback(self):
+        converter = unittest.mock.Mock(side_effect=ConversionUnavailable("CWP3 无法解码"))
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
+        )
+        item = CatalogItem(
+            "scene-1", "场景测试", "https://img-baofun.zhhainiao.com/frame.jpg",
+            resource_kind="dynamic", format="scene",
+            source_video_url="https://img-baofun.zhhainiao.com/scene_source.mp4",
+            preview_video_url="https://img-baofun.zhhainiao.com/scene_preview.mp4",
+        )
+        source._items_by_id[item.id] = item
+
+        # scene 且有正式源时必须硬拦，保留 33070dc 的假时钟安全边界。
+        with self.assertRaises(CatalogError) as ctx:
             source.download_original(item.id)
         self.assertEqual(len(converter.call_args_list), 1)
+        self.assertIn("动态壁纸", str(ctx.exception))
+        self.assertIn("禁止自动回退", str(ctx.exception))
+
+    def test_live_component_theme_via_dynamic_source_is_blocked(self):
+        converter = unittest.mock.Mock()
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
+        )
+        item = CatalogItem(
+            "theme-risk", "实时天气主题", "https://img-baofun.zhhainiao.com/frame.jpg",
+            resource_kind="theme", format="scene",
+            preview_video_url="https://img-baofun.zhhainiao.com/theme_preview.mp4",
+        )
+        source._items_by_id[item.id] = item
+
+        # 风险主题经全局搜索落到动态源时也必须拦截，避免静默烘焙假时钟。
+        with self.assertRaises(CatalogError) as ctx:
+            source.download_original(item.id)
+        converter.assert_not_called()
+        self.assertIn("电脑主题", str(ctx.exception))
+        self.assertIn("禁止自动回退", str(ctx.exception))
+
+    def test_plain_theme_via_dynamic_source_falls_back_to_preview(self):
+        preview = ConvertedFrame(b"theme-preview-jpeg", 1920, 1080, 2.0, 50.0, 5)
+        converter = unittest.mock.Mock(return_value=preview)
+        source = YuanqiDynamicResourceSource(
+            lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
+        )
+        item = CatalogItem(
+            "theme-plain", "普通风景主题", "https://img-baofun.zhhainiao.com/frame.jpg",
+            resource_kind="theme", format="scene",
+            preview_video_url="https://img-baofun.zhhainiao.com/theme_preview.mp4",
+        )
+        source._items_by_id[item.id] = item
+
+        # 普通主题没有识别出实时组件，仍可安全降级到预览视频。
+        self.assertEqual(source.download_original(item.id), b"theme-preview-jpeg")
+        converter.assert_called_once_with(item.preview_video_url, http=source._http, decrypt=False)
+        self.assertTrue(source.conversion_summary(item.id).startswith("预览视频 · "))
+
+    def test_dynamic_private_container_source_is_skipped_before_converter(self):
+        for suffix in (".cwp", ".zip"):
+            with self.subTest(suffix=suffix):
+                preview = ConvertedFrame(b"preview-jpeg", 1920, 1080, 3.3, 100.0, 5)
+                converter = unittest.mock.Mock(return_value=preview)
+                source = YuanqiDynamicResourceSource(
+                    lambda: {"uid": "u", "token": "t"}, lambda: {"deviceId": "d"}, converter=converter
+                )
+                item = CatalogItem(
+                    f"private{suffix}", "测试", "https://img-baofun.zhhainiao.com/frame.jpg",
+                    resource_kind="dynamic",
+                    source_video_url=f"https://img-baofun.zhhainiao.com/scene{suffix}",
+                    preview_video_url="https://img-baofun.zhhainiao.com/scene_preview.mp4",
+                )
+                source._items_by_id[item.id] = item
+
+                # 私有容器提前跳过，避免白下载几十 MiB；非 scene 仍可回退预览视频。
+                self.assertEqual(source.download_original(item.id), b"preview-jpeg")
+                converter.assert_called_once_with(item.preview_video_url, http=source._http, decrypt=False)
+                self.assertTrue(source.conversion_summary(item.id).startswith("预览回退 · "))
 
     def test_dynamic_global_search_uses_official_endpoint(self):
         source = YuanqiDynamicResourceSource(
