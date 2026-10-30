@@ -11,7 +11,7 @@ CI 版本为 `0.1.<github.run_number>`，只写构建工作区的 `app/app_versi
 
 安装路径固定为 `%LOCALAPPDATA%\Programs\DesktopGallery`，无需管理员权限，默认创建当前用户桌面图标和开始菜单入口。固定 AppId 支持原位升级，卸载仅删除安装内容，不清理应用的用户数据目录。安装器使用 `Local\NativeWallpaperManagerSingleInstance` 互斥锁保护运行中的应用；应用更新助手必须等待主程序完全退出后启动安装器。`/SILENT /RESTARTAPP` 安装结束自动重启应用；普通交互安装可选择立即启动。
 
-主程序 `DesktopGallery.exe` 为无控制台 GUI；微信登录独立为 `DesktopGalleryLogin.exe` 控制台进程，供主进程隐藏窗口并捕获标准输出。两者共用 `_internal` 依赖，发布时必须包含整个 PyInstaller 目录。登录需要系统 WebView2 Runtime；动态转换仍需要原应用要求的外部 ffmpeg/ffprobe，这次打包没有附带第三方视频工具。
+主程序 `DesktopGallery.exe` 为无控制台 GUI；微信登录独立为 `DesktopGalleryLogin.exe` 控制台进程，供主进程隐藏窗口并捕获标准输出。两者共用 `_internal` 依赖，发布时必须包含整个 PyInstaller 目录。登录需要系统 WebView2 Runtime；动态转静态所需的 `ffmpeg.exe`/`ffprobe.exe` 随包分发，固定在 `_internal\tools\ffmpeg\bin`，桌面画廊不再依赖用户机器上安装的 FFmpeg。转换组件由 `packaging/prepare_ffmpeg.ps1` 固定版本、校验 SHA-256 后暂存到 `tools\ffmpeg\bin`（源码运行与打包共用），PyInstaller spec 再把它收进包内并附带 LGPL 许可证文本 `_internal\tools\ffmpeg\LICENSE.txt`。
 
 当前发行仓库公开，客户端匿名读取 Release 即可检查并下载更新。CI 仍使用 GitHub 自动注入的 `GITHUB_TOKEN`，仅用于发布步骤，不打入应用；禁止把开发者 token 写入代码、构建产物或 Release。仅当更新源是私有镜像或 Fork 时，才需要用户自配对该仓库具有 Contents 只读权限的 token。
 
@@ -26,6 +26,8 @@ python -m venv .venv-build
 ```
 
 Inno Setup 不在标准位置时传 `-Iscc '完整路径\ISCC.exe'`；只打包可执行目录可加 `-BundleOnly`。产物在 `dist/installer/`。构建使用明确收集的源码、图标和依赖，不递归打包仓库或私人资料。
+
+构建会自动调用 `packaging/prepare_ffmpeg.ps1` 暂存自带转换组件；已暂存时直接复用。离线或使用自备构建包时传 `-FfmpegZip '完整路径\ffmpeg.zip'`，脚本仍会校验固定 SHA-256。缺少 `ffmpeg.exe`/`ffprobe.exe` 时 spec 和构建后校验都会硬失败，避免发出不能转换动态壁纸的安装包。
 
 CI 在发布前运行冻结程序的离线冒烟：`DesktopGallery.exe --smoke` 初始化隔离数据的 Tk 界面；`DesktopGalleryLogin.exe --smoke-package` 用隐藏本地 HTML 验证 WebView2 JavaScript 执行，15 秒超时失败。两个进程均需正常退出，CI 另设 60 秒上限。登录脚本原有 `--smoke` 仍用于联网二维码页检查，不用于发布流水线。
 

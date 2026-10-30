@@ -13,6 +13,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from contextlib import nullcontext
@@ -149,6 +150,50 @@ def store_cached_frame(
             temp_metadata.unlink(missing_ok=True)
 
 
+CONVERTER_TOOL_NAMES = ("ffmpeg.exe", "ffprobe.exe")
+CONVERTER_TOOL_SUBDIRS = (Path("tools") / "ffmpeg" / "bin", Path("tools") / "bin")
+CONVERTER_TOOL_HINT = (
+    "安装包自带的 FFmpeg 转换组件缺失，无法把动态预览转成静态画面。"
+    "请重新运行桌面画廊安装包修复安装（安装包内含 tools\\ffmpeg\\bin\\ffmpeg.exe 与 ffprobe.exe）；"
+    "源码运行请把这两个文件放到仓库 tools\\ffmpeg\\bin 下。"
+)
+
+
+def _bundled_tool_bases() -> tuple[Path, ...]:
+    """程序自带转换组件的候选根目录：冻结后为安装目录/运行解包目录，源码运行为仓库根。"""
+    bases: list[Path] = []
+    unpacked = str(getattr(sys, "_MEIPASS", "") or "")
+    if unpacked:
+        bases.append(Path(unpacked))
+    if getattr(sys, "frozen", False):
+        try:
+            bases.append(Path(sys.executable).resolve().parent)
+        except OSError:
+            pass
+    try:
+        bases.append(Path(__file__).resolve().parent.parent)
+    except OSError:
+        pass
+    unique: list[Path] = []
+    for base in bases:
+        try:
+            resolved = base.resolve()
+        except OSError:
+            continue
+        if resolved not in unique:
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _tool_search_dirs() -> tuple[Path, ...]:
+    """按优先级展开自带工具目录，不读取环境变量，避免被外部安装影响。"""
+    dirs: list[Path] = []
+    for base in _bundled_tool_bases():
+        dirs.extend(base / subdir for subdir in CONVERTER_TOOL_SUBDIRS)
+        dirs.append(base)
+    return tuple(dirs)
+
+
 def _bundled_winget_tool(name: str) -> str | None:
     packages = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
     if not packages.is_dir():
@@ -158,10 +203,19 @@ def _bundled_winget_tool(name: str) -> str | None:
 
 
 def find_ffmpeg_tools() -> tuple[str, str]:
+    """返回转换工具路径：安装包自带组件优先，其次系统 PATH，最后兼容 WinGet 安装。
+
+    自带组件固定在 `tools\\ffmpeg\\bin`（安装版在 `_internal\\tools\\ffmpeg\\bin`），
+    这样桌面画廊不再依赖用户机器上另行安装的 FFmpeg。
+    """
+    for directory in _tool_search_dirs():
+        bundled = tuple(directory / name for name in CONVERTER_TOOL_NAMES)
+        if all(path.is_file() for path in bundled):
+            return str(bundled[0]), str(bundled[1])
     ffmpeg = shutil.which("ffmpeg") or _bundled_winget_tool("ffmpeg")
     ffprobe = shutil.which("ffprobe") or _bundled_winget_tool("ffprobe")
     if not ffmpeg or not ffprobe:
-        raise ConversionUnavailable("未找到 FFmpeg，无法从动态预览中可靠提取高清帧")
+        raise ConversionUnavailable(CONVERTER_TOOL_HINT)
     return ffmpeg, ffprobe
 
 

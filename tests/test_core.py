@@ -27,12 +27,14 @@ from catalog import (
     YuanqiThemeResourceSource,
     validate_resource_preview_video_url,
 )
+import dynamic_converter
 from dynamic_converter import (
     ConversionUnavailable,
     ConvertedFrame,
     candidate_timestamps,
     convert_preview_video_to_jpeg,
     decrypt_video_bytes,
+    find_ffmpeg_tools,
     frame_quality,
     load_cached_frame,
     store_cached_frame,
@@ -324,6 +326,40 @@ class CoreTests(unittest.TestCase):
                     sharp.paste("black", (x, y, x + 16, y + 16))
         blurred = sharp.filter(ImageFilter.GaussianBlur(8))
         self.assertGreater(frame_quality(sharp), frame_quality(blurred))
+
+    def test_conversion_tools_prefer_bundled_package_directory(self):
+        # 安装版把转换组件放在 tools\ffmpeg\bin，必须优先于系统 PATH，避免依赖用户机器。
+        with tempfile.TemporaryDirectory() as temp:
+            installed = Path(temp)
+            bundled = installed / "tools" / "ffmpeg" / "bin"
+            bundled.mkdir(parents=True)
+            for name in ("ffmpeg.exe", "ffprobe.exe"):
+                (bundled / name).write_bytes(b"MZ-bundled")
+            with patch.object(dynamic_converter, "_bundled_tool_bases", return_value=(installed,)), patch.object(
+                dynamic_converter.shutil, "which", side_effect=AssertionError("bundled tools must win over PATH")
+            ):
+                self.assertEqual(
+                    find_ffmpeg_tools(),
+                    (str(bundled / "ffmpeg.exe"), str(bundled / "ffprobe.exe")),
+                )
+
+    def test_conversion_tools_fall_back_to_path_when_package_is_unbundled(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "_bundled_tool_bases", return_value=(Path(temp),)
+        ), patch.object(dynamic_converter.shutil, "which", side_effect=lambda name: f"C:/tools/{name}.exe"):
+            self.assertEqual(find_ffmpeg_tools(), ("C:/tools/ffmpeg.exe", "C:/tools/ffprobe.exe"))
+
+    def test_missing_conversion_tools_message_explains_bundled_repair(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "_bundled_tool_bases", return_value=(Path(temp),)
+        ), patch.object(dynamic_converter.shutil, "which", return_value=None), patch.object(
+            dynamic_converter, "_bundled_winget_tool", return_value=None
+        ):
+            with self.assertRaises(ConversionUnavailable) as raised:
+                find_ffmpeg_tools()
+        message = str(raised.exception)
+        self.assertIn(r"tools\ffmpeg\bin", message)
+        self.assertIn("重新运行桌面画廊安装包", message)
 
     def test_dynamic_conversion_cache_is_validated_and_bypasses_ffmpeg(self):
         with tempfile.TemporaryDirectory() as temp:

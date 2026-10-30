@@ -2666,6 +2666,32 @@ class App:
 
 
 if __name__ == "__main__":
+    if "--smoke-tools" in sys.argv[1:]:
+        # 打包自检：冻结后的程序必须解析到自带的 FFmpeg，不依赖用户机器上的安装。
+        # 无控制台 GUI 的 stdout 可能不可用，所以把结果同时写到可选的文件参数里。
+        from dynamic_converter import ConversionUnavailable, find_ffmpeg_tools
+
+        report_path: Path | None = None
+        position = sys.argv.index("--smoke-tools")
+        if len(sys.argv) > position + 1 and not sys.argv[position + 1].startswith("--"):
+            report_path = Path(sys.argv[position + 1])
+        try:
+            ffmpeg, ffprobe = find_ffmpeg_tools()
+            payload = {"ok": True, "ffmpeg": ffmpeg, "ffprobe": ffprobe}
+            exit_code = 0
+        except ConversionUnavailable as exc:
+            payload = {"ok": False, "error": str(exc)}
+            exit_code = 1
+        if report_path is not None:
+            try:
+                report_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                exit_code = 1
+        try:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        except (OSError, ValueError, AttributeError):
+            pass
+        raise SystemExit(exit_code)
     if "--smoke" in sys.argv[1:]:
         # Packaging QA uses a throwaway library, no mutex, login, tray or startup writes.
         with tempfile.TemporaryDirectory(prefix="DesktopGallery-smoke-") as smoke_dir:

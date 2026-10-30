@@ -40,9 +40,22 @@ jobs:
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Test
         run: python -m unittest discover -s tests
+      - name: Stage bundled FFmpeg converter
+        shell: pwsh
+        run: ./packaging/prepare_ffmpeg.ps1
       - name: Build Windows installer
         shell: pwsh
         run: ./packaging/build.ps1 -Iscc $env:INNO_ISCC
+      - name: Verify bundled converters
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'bundled-tools.json'
+          $process = Start-Process 'dist/DesktopGallery/DesktopGallery.exe' -ArgumentList @('--smoke-tools', $report) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Bundled converter self-check failed with exit code $($process.ExitCode)" }
+          if (!(Test-Path -LiteralPath $report)) { throw 'Bundled converter self-check did not write a report' }
+          $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if (-not $result.ok) { throw "Bundled converter missing: $($result.error)" }
+          if ($result.ffmpeg -notmatch '_internal\\tools\\ffmpeg\\bin\\ffmpeg\.exe$') { throw "Unexpected converter path: $($result.ffmpeg)" }
       - name: Smoke test frozen applications
         shell: pwsh
         run: |
