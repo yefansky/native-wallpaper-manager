@@ -327,15 +327,34 @@ class CoreTests(unittest.TestCase):
         blurred = sharp.filter(ImageFilter.GaussianBlur(8))
         self.assertGreater(frame_quality(sharp), frame_quality(blurred))
 
+    def test_conversion_tools_prefer_local_converter_pack(self):
+        # 首次转换下载的组件放在本机数据目录，必须先于程序目录和系统 PATH。
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "CONVERTER_TOOL_DIR", Path(temp) / "converter" / "bin"
+        ), patch.object(dynamic_converter, "_bundled_tool_bases", return_value=()):
+            tool_dir = Path(dynamic_converter.CONVERTER_TOOL_DIR)
+            tool_dir.mkdir(parents=True)
+            for name in ("ffmpeg.exe", "ffprobe.exe"):
+                (tool_dir / name).write_bytes(b"MZ-pack")
+            with patch.object(
+                dynamic_converter.shutil, "which", side_effect=AssertionError("local pack must win over PATH")
+            ):
+                self.assertEqual(
+                    find_ffmpeg_tools(),
+                    (str(tool_dir / "ffmpeg.exe"), str(tool_dir / "ffprobe.exe")),
+                )
+
     def test_conversion_tools_prefer_bundled_package_directory(self):
-        # 安装版把转换组件放在 tools\ffmpeg\bin，必须优先于系统 PATH，避免依赖用户机器。
+        # 源码运行或手工放置的 tools\ffmpeg\bin 优先于系统 PATH，避免依赖用户机器。
         with tempfile.TemporaryDirectory() as temp:
             installed = Path(temp)
             bundled = installed / "tools" / "ffmpeg" / "bin"
             bundled.mkdir(parents=True)
             for name in ("ffmpeg.exe", "ffprobe.exe"):
                 (bundled / name).write_bytes(b"MZ-bundled")
-            with patch.object(dynamic_converter, "_bundled_tool_bases", return_value=(installed,)), patch.object(
+            with patch.object(dynamic_converter, "CONVERTER_TOOL_DIR", installed / "pack" / "bin"), patch.object(
+                dynamic_converter, "_bundled_tool_bases", return_value=(installed,)
+            ), patch.object(
                 dynamic_converter.shutil, "which", side_effect=AssertionError("bundled tools must win over PATH")
             ):
                 self.assertEqual(
@@ -345,12 +364,16 @@ class CoreTests(unittest.TestCase):
 
     def test_conversion_tools_fall_back_to_path_when_package_is_unbundled(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "CONVERTER_TOOL_DIR", Path(temp) / "pack" / "bin"
+        ), patch.object(
             dynamic_converter, "_bundled_tool_bases", return_value=(Path(temp),)
         ), patch.object(dynamic_converter.shutil, "which", side_effect=lambda name: f"C:/tools/{name}.exe"):
             self.assertEqual(find_ffmpeg_tools(), ("C:/tools/ffmpeg.exe", "C:/tools/ffprobe.exe"))
 
-    def test_missing_conversion_tools_message_explains_bundled_repair(self):
+    def test_missing_conversion_tools_message_explains_automatic_download(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "CONVERTER_TOOL_DIR", Path(temp) / "pack" / "bin"
+        ), patch.object(
             dynamic_converter, "_bundled_tool_bases", return_value=(Path(temp),)
         ), patch.object(dynamic_converter.shutil, "which", return_value=None), patch.object(
             dynamic_converter, "_bundled_winget_tool", return_value=None
@@ -358,8 +381,81 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(ConversionUnavailable) as raised:
                 find_ffmpeg_tools()
         message = str(raised.exception)
+        self.assertIn("自动从 GitHub 下载", message)
         self.assertIn(r"tools\ffmpeg\bin", message)
-        self.assertIn("重新运行桌面画廊安装包", message)
+
+    def test_converter_pack_download_verifies_checksum_and_installs(self):
+        import hashlib
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("ffmpeg.exe", b"MZ-ffmpeg")
+            archive.writestr("ffprobe.exe", b"MZ-ffprobe")
+            archive.writestr("LICENSE.txt", b"LGPL")
+        payload = buffer.getvalue()
+        digest = hashlib.sha256(payload).hexdigest()
+
+        class FakeResponse:
+            def __init__(self, content=b"", text=""):
+                self.content = content
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, size):
+                yield self.content
+
+        class FakeHttp:
+            def get(self, url, timeout, stream=False):
+                if url.endswith(".sha256"):
+                    return FakeResponse(text=f"{digest}  pack.zip")
+                return FakeResponse(content=payload)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "CONVERTER_TOOL_DIR", Path(temp) / "converter" / "bin"
+        ), patch.object(dynamic_converter, "_bundled_tool_bases", return_value=()), patch.object(
+            dynamic_converter.shutil, "which", return_value=None
+        ), patch.object(dynamic_converter, "_bundled_winget_tool", return_value=None):
+            ffmpeg, ffprobe = dynamic_converter.install_converter_pack(http=FakeHttp())
+            tool_dir = Path(dynamic_converter.CONVERTER_TOOL_DIR)
+            self.assertEqual(Path(ffmpeg), tool_dir / "ffmpeg.exe")
+            self.assertEqual(Path(ffprobe), tool_dir / "ffprobe.exe")
+            self.assertTrue((tool_dir / "LICENSE.txt").is_file())
+            self.assertEqual((tool_dir / "ffmpeg.exe").read_bytes(), b"MZ-ffmpeg")
+            # 已安装后再次调用不再下载。
+            self.assertEqual(dynamic_converter.install_converter_pack(http=FakeHttp()), (ffmpeg, ffprobe))
+
+    def test_converter_pack_rejects_bad_checksum(self):
+        import hashlib
+
+        class FakeResponse:
+            def __init__(self, content=b"", text=""):
+                self.content = content
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, size):
+                yield self.content
+
+        class FakeHttp:
+            def get(self, url, timeout, stream=False):
+                if url.endswith(".sha256"):
+                    return FakeResponse(text=hashlib.sha256(b"different").hexdigest())
+                return FakeResponse(content=b"not-a-zip")
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            dynamic_converter, "CONVERTER_TOOL_DIR", Path(temp) / "converter" / "bin"
+        ), patch.object(dynamic_converter, "_bundled_tool_bases", return_value=()), patch.object(
+            dynamic_converter.shutil, "which", return_value=None
+        ), patch.object(dynamic_converter, "_bundled_winget_tool", return_value=None):
+            with self.assertRaises(ConversionUnavailable) as raised:
+                dynamic_converter.install_converter_pack(http=FakeHttp())
+            self.assertIn("校验失败", str(raised.exception))
+            self.assertFalse(Path(dynamic_converter.CONVERTER_TOOL_DIR).exists())
 
     def test_dynamic_conversion_cache_is_validated_and_bypasses_ffmpeg(self):
         with tempfile.TemporaryDirectory() as temp:

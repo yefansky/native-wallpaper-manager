@@ -40,22 +40,41 @@ jobs:
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Test
         run: python -m unittest discover -s tests
-      - name: Stage bundled FFmpeg converter
+      - name: Publish converter pack once
         shell: pwsh
-        run: ./packaging/prepare_ffmpeg.ps1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'converter-v1'
+          $existing = gh release view $tag --json isDraft 2>$null | ConvertFrom-Json
+          if ($existing -and !$existing.isDraft) {
+            Write-Host 'Converter pack is already published; keep the fixed asset unchanged.'
+            exit 0
+          }
+          ./packaging/prepare_ffmpeg.ps1
+          $out = 'build/DesktopGallery-FFmpeg-LGPL-8.1-win64.zip'
+          New-Item -ItemType Directory -Force build | Out-Null
+          Compress-Archive -Path 'build/converter/ffmpeg.exe', 'build/converter/ffprobe.exe', 'build/converter/LICENSE.txt' -DestinationPath $out -Force
+          $hash = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $out -Leaf)" | Set-Content -LiteralPath "$out.sha256" -Encoding ascii
+          if (!$existing) {
+            gh release create $tag --draft --target '${{ github.sha }}' --title 'Desktop Gallery converter pack' --notes 'Fixed LGPL FFmpeg/FFprobe converter pack for Desktop Gallery dynamic wallpaper conversion. Desktop Gallery downloads it once on the first conversion.'
+            if ($LASTEXITCODE -ne 0) { throw 'Converter pack draft release creation failed' }
+          }
+          gh release upload $tag $out "$out.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Converter pack upload failed' }
+          $apiUrl = gh release view $tag --json apiUrl --jq .apiUrl
+          gh api --method PATCH $apiUrl -F draft=false -f make_latest=false --silent
+          if ($LASTEXITCODE -ne 0) { throw 'Converter pack publication failed' }
       - name: Build Windows installer
         shell: pwsh
         run: ./packaging/build.ps1 -Iscc $env:INNO_ISCC
-      - name: Verify bundled converters
+      - name: Verify installer stays slim
         shell: pwsh
         run: |
-          $report = Join-Path $env:RUNNER_TEMP 'bundled-tools.json'
-          $process = Start-Process 'dist/DesktopGallery/DesktopGallery.exe' -ArgumentList @('--smoke-tools', $report) -WindowStyle Hidden -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "Bundled converter self-check failed with exit code $($process.ExitCode)" }
-          if (!(Test-Path -LiteralPath $report)) { throw 'Bundled converter self-check did not write a report' }
-          $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-          if (-not $result.ok) { throw "Bundled converter missing: $($result.error)" }
-          if ($result.ffmpeg -notmatch '_internal\\tools\\ffmpeg\\bin\\ffmpeg\.exe$') { throw "Unexpected converter path: $($result.ffmpeg)" }
+          if (Test-Path 'dist/DesktopGallery/_internal/tools/ffmpeg') { throw 'Converter binaries must ship as the separate converter pack, not inside the installer' }
+          $installer = Get-ChildItem 'dist/installer/*-Setup.exe' | Select-Object -First 1
+          if ($installer.Length -gt 30MB) { throw "Installer grew unexpectedly: $([math]::Round($installer.Length/1MB,1)) MB" }
       - name: Smoke test frozen applications
         shell: pwsh
         run: |

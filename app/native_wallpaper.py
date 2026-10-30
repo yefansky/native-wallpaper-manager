@@ -37,6 +37,7 @@ from catalog import (
     theme_preview_has_live_component_risk,
 )
 from product import SingleInstance, autostart_enabled, set_autostart
+from dynamic_converter import set_progress_notifier
 from app_version import VERSION
 from updater import GitHubUpdater, load_update_token, save_update_token, launch_installer
 from yuanqi_auth import (
@@ -516,6 +517,8 @@ class App:
         self.selected_id = self.config.get("last_applied") or (self.items[0].id if self.items else None)
         self.timer: threading.Timer | None = None
         self.status = tk.StringVar(value="本地 Windows 原生功能已就绪；元气账号尚未接入本客户端。")
+        # 首次转换需要下载一次转换组件，把进度显示到底部状态栏。
+        set_progress_notifier(lambda text: self._safe_after(lambda: self.status.set(text)))
         self.photo_refs: list[ImageTk.PhotoImage] = []
         self._build()
         self.refresh()

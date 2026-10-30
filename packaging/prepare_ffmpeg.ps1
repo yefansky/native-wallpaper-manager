@@ -5,14 +5,14 @@ param(
     [string]$Destination = '',
     [switch]$Force
 )
-# 把 LGPL 构建的 ffmpeg.exe/ffprobe.exe 暂存到 tools/ffmpeg/bin，供源码运行和 PyInstaller 打包共用。
-# 桌面画廊自带转换组件，用户不再需要另外安装 FFmpeg；下载包固定版本并校验 SHA-256。
+# 把 LGPL 构建的 ffmpeg.exe/ffprobe.exe 暂存到 build/converter，供独立转换组件包使用。
+# 转换组件单独发布一次（converter-v1），安装包与日常更新不再重复携带约 90 MB 的二进制。
 $ErrorActionPreference = 'Stop'
 if (-not ('System.IO.Compression.ZipFile' -as [type])) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 }
 $root = Split-Path $PSScriptRoot -Parent
-if (!$Destination) { $Destination = Join-Path $root 'tools/ffmpeg/bin' }
+if (!$Destination) { $Destination = Join-Path $root 'build/converter' }
 $Destination = [IO.Path]::GetFullPath($Destination)
 
 $ffmpeg = Join-Path $Destination 'ffmpeg.exe'
@@ -49,9 +49,9 @@ try {
     }
     $license = Join-Path $bundle.FullName 'LICENSE.txt'
     if (Test-Path -LiteralPath $license) {
-        Copy-Item -LiteralPath $license -Destination (Join-Path $root 'tools/ffmpeg/LICENSE.txt') -Force
+        Copy-Item -LiteralPath $license -Destination (Join-Path $Destination 'LICENSE.txt') -Force
     }
-    Write-Host "Staged bundled FFmpeg converter in $Destination"
+    Write-Host "Staged converter binaries in $Destination"
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
