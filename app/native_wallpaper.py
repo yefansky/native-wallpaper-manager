@@ -52,12 +52,15 @@ from yuanqi_auth import (
     YuanqiAuthCoordinator,
 )
 from session_store import clear_session, load_session, save_session
+from session_notifications import SessionNotifications
 from wechat_login import WechatQrLoginBackend, log_diag, sha8
 from wallpaper_backend import (
     WallpaperApplyResult,
     current_native_wallpaper,
     same_windows_path,
     set_native_wallpaper,
+    _current_wallpaper_from_registry,
+    _current_wallpaper_from_system_api,
 )
 
 APP_DIR = Path.home() / "AppData" / "Local" / "NativeWallpaperManager"
@@ -482,6 +485,8 @@ class App:
         self._loading_online = False
         self._apply_operation_in_progress = False
         self._apply_operation_id: str | None = None
+        self._wallpaper_restore_generation = 0
+        self._session_notifications = None
         self._ui_queue: queue.Queue = queue.Queue()
         self.root.after(80, self._poll_ui_queue)
         if not smoke:
@@ -532,6 +537,11 @@ class App:
         self.schedule_next()
         if not smoke:
             self._init_tray()
+            try:
+                self._session_notifications = SessionNotifications(self.root, self._schedule_wallpaper_restore)
+            except OSError as exc:
+                self.status.set(f"无法监听 Windows 会话恢复：{exc}")
+            self._schedule_wallpaper_restore()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if getattr(sys, "frozen", False) and not smoke:
             if autostart_enabled():
@@ -1029,6 +1039,8 @@ class App:
         self._safe_after(self._quit_app)
 
     def _quit_app(self) -> None:
+        if self._session_notifications is not None:
+            self._session_notifications.close()
         if self.timer:
             self.timer.cancel()
         self._cancel_featured_carousel()
@@ -2512,11 +2524,14 @@ class App:
         conversion: str = "",
         operation_id: str | None = None,
         theme_path: Path | None = None,
+        restore: bool = False,
     ) -> None:
         """本地页与资源页共用的唯一系统应用入口。"""
 
         if self._apply_operation_in_progress and operation_id is None:
             return
+        if not restore:
+            self._wallpaper_restore_generation = getattr(self, "_wallpaper_restore_generation", 0) + 1
         operation_id = operation_id or uuid.uuid4().hex
         self._apply_operation_id = operation_id
         self._set_apply_controls_busy(origin)
@@ -2538,6 +2553,7 @@ class App:
                     applied_kind,
                     conversion,
                     theme_path,
+                    restore,
                 )
             )
 
@@ -2552,6 +2568,7 @@ class App:
         applied_kind: str,
         conversion: str,
         theme_path: Path | None,
+        restore: bool = False,
     ) -> None:
         if operation_id != self._apply_operation_id:
             return
@@ -2561,7 +2578,8 @@ class App:
         self._restore_apply_controls()
         if error is not None:
             self.status.set(f"Windows 应用失败：{wallpaper.title} · {error}")
-            messagebox.showerror("应用失败", str(error))
+            if not restore:
+                messagebox.showerror("应用失败", str(error))
             return
         if result is None:
             raise RuntimeError("Windows 应用操作没有返回结果")
@@ -2583,13 +2601,14 @@ class App:
         detail = f"（{conversion}）" if conversion else ""
         if result.confirmed:
             self.status.set(f"已由 Windows 系统接口确认应用为 {applied_kind}：{wallpaper.title}{detail}")
-            messagebox.showinfo("应用成功", f"“{wallpaper.title}”已应用为 {applied_kind}。")
+            if not restore:
+                messagebox.showinfo("应用成功", f"“{wallpaper.title}”已应用为 {applied_kind}。")
         else:
             observed = str(result.observed_path) if result.observed_path else "暂未返回路径"
             self.status.set(
                 f"Windows 已接受应用请求，但限时内尚未确认：{wallpaper.title}"
             )
-            messagebox.showwarning(
+            if not restore: messagebox.showwarning(
                 "Windows 已接受，正在确认",
                 f"“{wallpaper.title}”的设置请求已成功提交。\n\n"
                 f"当前系统读到：{observed}\n"
@@ -2600,6 +2619,32 @@ class App:
             messagebox.showwarning("应用记录未保存", f"壁纸已交给 Windows，但本地记录保存失败：{persistence_error}")
         if theme_error is not None:
             messagebox.showwarning("主题启动失败", f"静态壁纸已应用，但 Windows 主题文件未能启动：{theme_error}")
+
+    def _schedule_wallpaper_restore(self) -> None:
+        """Check a few times after startup/session change, then stop checking."""
+        self._wallpaper_restore_generation += 1
+        generation = self._wallpaper_restore_generation
+        for delay in (2000, 8000, 20000):
+            self.root.after(delay, lambda current=generation: self._restore_saved_wallpaper(current))
+
+    def _restore_saved_wallpaper(self, generation: int) -> None:
+        if generation != self._wallpaper_restore_generation or self._apply_operation_in_progress:
+            return
+        wallpaper = next((item for item in self.items if item.id == self.config.get("last_applied")), None)
+        if wallpaper is None:
+            return
+        path = Path(wallpaper.path)
+        try:
+            if not path.is_file() or not path.stat().st_size:
+                return
+            persisted = _current_wallpaper_from_registry()
+            current = _current_wallpaper_from_system_api()
+            if persisted is None or current is None:
+                return
+            if same_windows_path(persisted, path) and not same_windows_path(current, path):
+                self._start_wallpaper_apply(wallpaper, origin="restore", restore=True)
+        except OSError as exc:
+            self.status.set(f"无法检查会话恢复后的壁纸：{exc}")
 
     def apply_selected(self) -> None:
         item = self.selected()
@@ -2658,6 +2703,7 @@ class App:
             return
         favorites = [item for item in self.items if item.favorite]
         if favorites:
+            self._wallpaper_restore_generation += 1
             last = self.config.get("last_applied"); index = next((i for i, item in enumerate(favorites) if item.id == last), -1)
             item = favorites[(index + 1) % len(favorites)]
             try: set_native_wallpaper(Path(item.path)); self.config["last_applied"] = item.id; self.persist()
