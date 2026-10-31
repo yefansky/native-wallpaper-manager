@@ -79,6 +79,46 @@ class RestoreTests(unittest.TestCase):
         send(hwnd, WM_WTSSESSION_CHANGE, 3, 0)
         self.assertEqual(seen, [True])
 
+    def test_existing_wallpaper_enables_autostart_only_once(self):
+        self.subject.persist = MagicMock()
+        self.subject.refresh_autostart_button = MagicMock()
+        with patch.object(app, "autostart_enabled", return_value=False), patch.object(app, "set_autostart", return_value=True) as setter:
+            self.subject._ensure_restore_autostart()
+            self.subject._ensure_restore_autostart()
+        setter.assert_called_once_with(True)
+        self.assertTrue(self.subject.config["restore_autostart_migrated"])
+        self.subject.persist.assert_called_once()
+
+    def test_failed_registration_retries_and_save_failure_rolls_back(self):
+        self.subject.persist = MagicMock()
+        with patch.object(app, "autostart_enabled", return_value=False), patch.object(app, "set_autostart", return_value=False):
+            self.subject._ensure_restore_autostart()
+        self.assertNotIn("restore_autostart_migrated", self.subject.config)
+        self.subject.persist.assert_not_called()
+        self.subject.persist.side_effect = OSError("disk full")
+        with patch.object(app, "autostart_enabled", return_value=False), patch.object(app, "set_autostart", return_value=True) as setter:
+            self.subject._ensure_restore_autostart()
+        self.assertEqual([call.args for call in setter.call_args_list], [(True,), (False,)])
+        self.assertNotIn("restore_autostart_migrated", self.subject.config)
+
+    def test_explicit_disable_is_persisted_and_not_reversed(self):
+        self.subject.persist = MagicMock()
+        self.subject.refresh_autostart_button = MagicMock()
+        with patch.object(app, "autostart_enabled", return_value=True), patch.object(app, "set_autostart", return_value=True) as setter:
+            self.subject.toggle_autostart()
+        setter.assert_called_once_with(False)
+        with patch.object(app, "autostart_enabled", return_value=False), patch.object(app, "set_autostart") as setter:
+            self.subject._ensure_restore_autostart()
+        setter.assert_not_called()
+
+    def test_disable_does_not_change_registry_if_choice_cannot_be_saved(self):
+        self.subject.persist = MagicMock(side_effect=OSError("disk full"))
+        with patch.object(app, "autostart_enabled", return_value=True), patch.object(app, "set_autostart") as setter, patch.object(app.messagebox, "showerror") as error:
+            self.subject.toggle_autostart()
+        setter.assert_not_called()
+        error.assert_called_once()
+        self.assertNotIn("restore_autostart_migrated", self.subject.config)
+
 
 if __name__ == "__main__":
     unittest.main()

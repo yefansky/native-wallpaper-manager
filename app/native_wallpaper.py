@@ -540,6 +540,7 @@ class App:
         self.schedule_next()
         if not smoke:
             self._init_tray()
+            self._ensure_restore_autostart()
             try:
                 self._session_notifications = SessionNotifications(self.root, self._schedule_wallpaper_restore)
             except OSError as exc:
@@ -2203,11 +2204,47 @@ class App:
 
     def toggle_autostart(self) -> None:
         enabled = autostart_enabled()
+        # Persist the user's explicit choice before changing the registry, so a
+        # later launch cannot mistake a deliberate opt-out for an old install.
+        previous = self.config.get("restore_autostart_migrated")
+        self.config["restore_autostart_migrated"] = True
+        try:
+            self.persist()
+        except OSError as exc:
+            if previous is None:
+                self.config.pop("restore_autostart_migrated", None)
+            else:
+                self.config["restore_autostart_migrated"] = previous
+            messagebox.showerror("设置未保存", f"无法保存自启选择：{exc}")
+            return
         ok = set_autostart(not enabled)
         self.refresh_autostart_button()
         self.status.set("开机自启已开启。" if ok and not enabled else ("开机自启已关闭。" if ok else "设置开机自启失败。"))
         if not ok:
             messagebox.showerror("开机自启", "无法写入 HKCU 启动项，请检查权限。")
+
+    def _ensure_restore_autostart(self) -> None:
+        """One-time migration for an existing wallpaper, not an opt-out override."""
+        if self.config.get("restore_autostart_migrated"):
+            return
+        wallpaper = next((item for item in self.items if item.id == self.config.get("last_applied")), None)
+        if wallpaper is None or not Path(wallpaper.path).is_file():
+            return
+        was_enabled = autostart_enabled()
+        if not was_enabled and not set_autostart(True):
+            self.status.set("壁纸恢复需要开机自启；启用失败，请在“我的”中手动开启。")
+            return
+        self.config["restore_autostart_migrated"] = True
+        try:
+            self.persist()
+        except OSError as exc:
+            self.config.pop("restore_autostart_migrated", None)
+            rolled_back = was_enabled or set_autostart(False)
+            self.status.set(f"壁纸恢复自启设置未保存：{exc}" + ("" if rolled_back else "；自启项回退失败，请检查设置。"))
+            return
+        self.refresh_autostart_button()
+        if not was_enabled:
+            self.status.set("已开启开机自启，以便登录后恢复壁纸；可在“我的”中关闭。")
 
     def visible_items(self) -> list[Wallpaper]:
         return [
@@ -2622,6 +2659,8 @@ class App:
             messagebox.showwarning("应用记录未保存", f"壁纸已交给 Windows，但本地记录保存失败：{persistence_error}")
         if theme_error is not None:
             messagebox.showwarning("主题启动失败", f"静态壁纸已应用，但 Windows 主题文件未能启动：{theme_error}")
+        if not restore and persistence_error is None:
+            self._ensure_restore_autostart()
 
     def _schedule_wallpaper_restore(self) -> None:
         """Check a few times after startup/session change, then stop checking."""

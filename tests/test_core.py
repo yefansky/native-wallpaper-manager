@@ -1804,14 +1804,23 @@ class CoreTests(unittest.TestCase):
             second.release()
 
     def test_autostart_registry_toggle(self):
-        # 用真实的 HKCU Run 键测试开启/关闭，最终确保关闭。
+        # Isolate the real registry exercise from the user's actual startup entry.
+        import product
+        import winreg
+        import uuid
+        key_path = "Software\\NativeWallpaperManagerTests\\" + uuid.uuid4().hex
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path):
+            pass
         try:
-            ok_on = set_autostart(True)
-            self.assertTrue(ok_on)
-            self.assertTrue(autostart_enabled())
+            with patch.object(product, "RUN_KEY", key_path):
+                self.assertTrue(set_autostart(True))
+                self.assertTrue(autostart_enabled())
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                    self.assertEqual(winreg.QueryValueEx(key, product.APP_NAME)[0], autostart_command())
+                self.assertTrue(set_autostart(False))
+                self.assertFalse(autostart_enabled())
         finally:
-            set_autostart(False)
-        self.assertFalse(autostart_enabled())
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path)
 
     def test_config_round_trip(self):
         original = app.CONFIG_PATH
