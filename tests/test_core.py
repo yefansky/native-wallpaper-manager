@@ -60,6 +60,14 @@ from yuanqi_auth import (
 
 
 class CoreTests(unittest.TestCase):
+    def setUp(self):
+        # GUI tests instantiate the real application; never mutate the user's
+        # startup registration or schedule changes to their desktop wallpaper.
+        for name in ("_ensure_restore_autostart", "_schedule_wallpaper_restore"):
+            mocker = patch.object(app.App, name)
+            mocker.start()
+            self.addCleanup(mocker.stop)
+
     def test_supported_extensions(self):
         self.assertIn(".jpg", app.IMAGE_EXTENSIONS)
         self.assertNotIn(".mp4", app.IMAGE_EXTENSIONS)
