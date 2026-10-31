@@ -44,7 +44,7 @@
 - **发布**：推送到远端 `main` 触发 GitHub Actions 构建和发布；本地 commit 不触发。构建、版本规则、依赖和首次发布步骤见 [发布说明](docs/releasing.md)。
 
 - **运行**：双击 `run.bat`（首次运行会自动安装依赖，用 `pythonw` 无控制台启动）。
-- **动态转静态依赖**：需要 `ffmpeg.exe` 与 `ffprobe.exe`。程序会查找 PATH 和 WinGet 的 Gyan.FFmpeg 安装目录；找不到或预览低于 1280×720 时会明确拒绝转换，不会改用模糊缩略图。
+- **动态转静态（转换组件按需下载一次）**：安装包不背约 100 MB 的视频工具。第一次转换时程序从固定 Release `converter-v1` 下载 LGPL 构建的 `ffmpeg.exe` / `ffprobe.exe`，校验 SHA-256 后存到 `%LOCALAPPDATA%\NativeWallpaperManager\converter\bin` 并长期复用；底部状态栏显示下载进度。之后每次更新只下约 18 MB 的小包。也可离线把两个文件放进该目录或仓库 `tools\ffmpeg\bin`。查找顺序为“本机组件 → 程序目录副本 → 系统 PATH → WinGet”；预览低于 1280×720 或解码不可验证时仍明确拒绝转换，不会改用模糊缩略图。
 - **安装**：双击 `install.bat` → 安装依赖、创建开始菜单/桌面快捷方式、开启开机自启。
 - **卸载**：双击 `uninstall.bat` → 移除快捷方式与开机自启（数据目录保留）。
 
@@ -57,6 +57,12 @@
 - **单实例**：重复启动只提示"已在运行"，不会开多个窗口。
 - **登录态持久化**：微信扫码会话用 Windows DPAPI 加密保存，重启自动恢复登录。
 - **图标**：`app/icon.ico` 用于快捷方式与托盘。
+
+## 第三方组件与许可
+
+- **FFmpeg / FFprobe**：使用 `BtbN/FFmpeg-Builds` 的 Windows x64 LGPL 构建，固定为 `ffmpeg-n8.1.3` 版本并校验 SHA-256；只用于把可验证的动态预览解码成静态 JPEG。组件单独发布在 Release `converter-v1`（`DesktopGallery-FFmpeg-LGPL-8.1-win64.zip` + `.sha256`），程序首次转换时按需下载一次，不在安装包里重复携带。许可证文本随组件保存为 `LICENSE.txt`；FFmpeg 源码与许可证见 <https://ffmpeg.org/legal.html> 与 <https://github.com/BtbN/FFmpeg-Builds>。转换组件以独立进程调用，不与桌面画廊源码链接。
+- **WebView2 Runtime**：微信扫码登录窗口依赖系统已安装的 Microsoft Edge WebView2 Runtime。
+- **Python 运行时与依赖**：由 PyInstaller 冻结进 `_internal`，第三方 Python 包的许可证随各自包分发。
 
 ## 边界
 

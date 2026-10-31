@@ -13,8 +13,10 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+import zipfile
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +151,79 @@ def store_cached_frame(
             temp_metadata.unlink(missing_ok=True)
 
 
+CONVERTER_TOOL_NAMES = ("ffmpeg.exe", "ffprobe.exe")
+CONVERTER_TOOL_SUBDIRS = (Path("tools") / "ffmpeg" / "bin", Path("tools") / "bin")
+# 转换组件单独发一次（固定资产），安装包和每次更新都不再重复携带约 100 MB 的二进制。
+CONVERTER_TOOL_DIR = Path(
+    os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+) / "NativeWallpaperManager" / "converter" / "bin"
+CONVERTER_PACK_URL = (
+    "https://github.com/yefansky/native-wallpaper-manager/releases/download/"
+    "converter-v1/DesktopGallery-FFmpeg-LGPL-8.1-win64.zip"
+)
+CONVERTER_PACK_SHA256_URL = CONVERTER_PACK_URL + ".sha256"
+CONVERTER_PACK_MAX_BYTES = 220 * 1024 * 1024
+CONVERTER_TOOL_HINT = (
+    "转换组件还没有就绪，无法把动态预览转成静态画面。"
+    "程序会自动从 GitHub 下载并校验一次（约 100 MB，之后复用）；"
+    f"离线时可把 ffmpeg.exe 与 ffprobe.exe 放到 {CONVERTER_TOOL_DIR} 或 tools\\ffmpeg\\bin。"
+)
+
+_progress_notifier: Callable[[str], None] | None = None
+_install_lock = threading.Lock()
+
+
+def set_progress_notifier(notifier: Callable[[str], None] | None) -> None:
+    """界面用一个回调展示首次下载转换组件的进度；不设置时静默。"""
+    global _progress_notifier
+    _progress_notifier = notifier
+
+
+def _notify_progress(message: str) -> None:
+    notifier = _progress_notifier
+    if notifier is None:
+        return
+    try:
+        notifier(message)
+    except Exception:  # noqa: BLE001 - 进度展示失败不能影响转换
+        pass
+
+
+def _bundled_tool_bases() -> tuple[Path, ...]:
+    """程序目录附近的候选根目录：冻结后为安装目录/运行解包目录，源码运行为仓库根。"""
+    bases: list[Path] = []
+    unpacked = str(getattr(sys, "_MEIPASS", "") or "")
+    if unpacked:
+        bases.append(Path(unpacked))
+    if getattr(sys, "frozen", False):
+        try:
+            bases.append(Path(sys.executable).resolve().parent)
+        except OSError:
+            pass
+    try:
+        bases.append(Path(__file__).resolve().parent.parent)
+    except OSError:
+        pass
+    unique: list[Path] = []
+    for base in bases:
+        try:
+            resolved = base.resolve()
+        except OSError:
+            continue
+        if resolved not in unique:
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _tool_search_dirs() -> tuple[Path, ...]:
+    """按优先级展开转换组件目录：本机下载的组件在前，其次随目录放置的副本。"""
+    dirs: list[Path] = [CONVERTER_TOOL_DIR]
+    for base in _bundled_tool_bases():
+        dirs.extend(base / subdir for subdir in CONVERTER_TOOL_SUBDIRS)
+        dirs.append(base)
+    return tuple(dirs)
+
+
 def _bundled_winget_tool(name: str) -> str | None:
     packages = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
     if not packages.is_dir():
@@ -158,11 +233,104 @@ def _bundled_winget_tool(name: str) -> str | None:
 
 
 def find_ffmpeg_tools() -> tuple[str, str]:
+    """返回本机已有的转换工具路径，不联网。
+
+    顺序：本机下载的转换组件 → 程序目录旁的副本 → 系统 PATH → WinGet。
+    全都没有时抛 `ConversionUnavailable`，由 `ensure_ffmpeg_tools` 负责一次性下载。
+    """
+    for directory in _tool_search_dirs():
+        bundled = tuple(directory / name for name in CONVERTER_TOOL_NAMES)
+        if all(path.is_file() for path in bundled):
+            return str(bundled[0]), str(bundled[1])
     ffmpeg = shutil.which("ffmpeg") or _bundled_winget_tool("ffmpeg")
     ffprobe = shutil.which("ffprobe") or _bundled_winget_tool("ffprobe")
     if not ffmpeg or not ffprobe:
-        raise ConversionUnavailable("未找到 FFmpeg，无法从动态预览中可靠提取高清帧")
+        raise ConversionUnavailable(CONVERTER_TOOL_HINT)
     return ffmpeg, ffprobe
+
+
+def _download_converter_pack(http: object) -> bytes:
+    try:
+        response = http.get(CONVERTER_PACK_URL, timeout=300, stream=True)
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        received = 0
+        for chunk in response.iter_content(1024 * 1024):
+            if not chunk:
+                continue
+            received += len(chunk)
+            if received > CONVERTER_PACK_MAX_BYTES:
+                raise ConversionUnavailable("转换组件包超过安全大小上限，已中止下载")
+            chunks.append(chunk)
+            if received % (8 * 1024 * 1024) < len(chunk):
+                _notify_progress(f"正在下载转换组件… {received // (1024 * 1024)} MB / 约 100 MB")
+        if not chunks:
+            raise ConversionUnavailable("转换组件包下载为空")
+        return b"".join(chunks)
+    except ConversionUnavailable:
+        raise
+    except (OSError, ValueError, requests.RequestException) as exc:
+        raise ConversionUnavailable(f"转换组件下载失败：{type(exc).__name__}") from exc
+
+
+def _install_converter_pack(http: object) -> None:
+    try:
+        checksum_response = http.get(CONVERTER_PACK_SHA256_URL, timeout=45)
+        checksum_response.raise_for_status()
+        expected = str(checksum_response.text).split()[0].strip().lower()
+    except (OSError, ValueError, IndexError, requests.RequestException) as exc:
+        raise ConversionUnavailable(f"转换组件校验信息读取失败：{type(exc).__name__}") from exc
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        raise ConversionUnavailable("转换组件校验信息格式无效，已中止安装")
+    data = _download_converter_pack(http)
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ConversionUnavailable("转换组件包校验失败，已中止安装")
+    try:
+        CONVERTER_TOOL_DIR.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = {
+                Path(info.filename).name: info
+                for info in archive.infolist()
+                if not info.is_dir()
+            }
+            missing = [name for name in CONVERTER_TOOL_NAMES if name not in members]
+            if missing:
+                raise ConversionUnavailable("转换组件包缺少 ffmpeg.exe 或 ffprobe.exe")
+            for name in (*CONVERTER_TOOL_NAMES, "LICENSE.txt"):
+                info = members.get(name)
+                if info is None:
+                    continue
+                with archive.open(info) as source, tempfile.NamedTemporaryFile(
+                    "wb", delete=False, dir=CONVERTER_TOOL_DIR, suffix=".tmp"
+                ) as output:
+                    temp_path = Path(output.name)
+                    shutil.copyfileobj(source, output)
+                os.replace(temp_path, CONVERTER_TOOL_DIR / name)
+    except ConversionUnavailable:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise ConversionUnavailable(f"转换组件安装失败：{type(exc).__name__}") from exc
+
+
+def install_converter_pack(http: object = requests) -> tuple[str, str]:
+    """一次性下载固定版本的转换组件并校验 SHA-256；并发调用只安装一次。"""
+    with _install_lock:
+        try:
+            return find_ffmpeg_tools()
+        except ConversionUnavailable:
+            pass
+        _notify_progress("正在准备转换组件（首次转换需要，约 100 MB）…")
+        _install_converter_pack(http)
+        _notify_progress("转换组件已就绪")
+        return find_ffmpeg_tools()
+
+
+def ensure_ffmpeg_tools() -> tuple[str, str]:
+    """转换入口使用：本机有组件就直接用，没有才下载一次。"""
+    try:
+        return find_ffmpeg_tools()
+    except ConversionUnavailable:
+        return install_converter_pack()
 
 
 def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[bytes]:
@@ -270,7 +438,7 @@ def convert_preview_video_to_jpeg(
     url: str,
     *,
     http: object = requests,
-    tool_finder: Callable[[], tuple[str, str]] = find_ffmpeg_tools,
+    tool_finder: Callable[[], tuple[str, str]] = ensure_ffmpeg_tools,
     cache_dir: Path | None = DYNAMIC_FRAME_CACHE_DIR,
     decrypt: bool = False,
 ) -> ConvertedFrame:
