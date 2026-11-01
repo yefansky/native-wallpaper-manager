@@ -39,6 +39,7 @@ from catalog import (
 from product import SingleInstance, autostart_enabled, set_autostart
 from dynamic_converter import set_progress_notifier
 from app_version import VERSION
+import runtime_diagnostics as diagnostics
 from updater import GitHubUpdater, load_update_token, save_update_token, launch_installer
 from yuanqi_auth import (
     AuthPhase,
@@ -1026,7 +1027,8 @@ class App:
             pystray.MenuItem("退出", self._tray_quit),
         )
         self.tray_icon = pystray.Icon("desktop_gallery", self._make_tray_image(), "桌面画廊 · 原生壁纸管理器", menu)
-        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        self._tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True, name="gallery-tray")
+        self._tray_thread.start()
 
     def _on_close(self) -> None:
         """点窗口关闭按钮时隐藏到系统托盘，不退出程序。"""
@@ -1043,6 +1045,7 @@ class App:
         self._safe_after(self._quit_app)
 
     def _quit_app(self) -> None:
+        diagnostics.record_desktop("normal_quit_requested", tray_thread=getattr(self, "_tray_thread", None))
         if self._session_notifications is not None:
             self._session_notifications.close()
         if self.timer:
@@ -1054,6 +1057,7 @@ class App:
         except Exception:
             pass
         self.root.destroy()
+        diagnostics.record("tk_destroyed")
 
     def _poll_ui_queue(self) -> None:
         """主线程每 80ms 排空 UI 更新队列，再重新调度自身。"""
@@ -1065,6 +1069,7 @@ class App:
                 except Exception as exc:
                     # UI 回调失败不能把业务状态永久留在“进行中”。
                     log_diag(f"ui callback failed: {exc!r}")
+                    diagnostics.record_exception("ui_callback_failed", type(exc), exc, exc.__traceback__)
                     try:
                         self._restore_apply_controls()
                         self.status.set(f"界面收尾异常，操作状态已复位：{exc}")
@@ -2624,6 +2629,9 @@ class App:
         if result is None:
             raise RuntimeError("Windows 应用操作没有返回结果")
 
+        diagnostics.record_desktop("wallpaper_apply_returned", target=Path(wallpaper.path),
+                                   tray_thread=getattr(self, "_tray_thread", None))
+
         self.config["last_applied"] = wallpaper.id
         persistence_error: OSError | None = None
         try:
@@ -2676,6 +2684,7 @@ class App:
         if wallpaper is None:
             return
         path = Path(wallpaper.path)
+        diagnostics.record_desktop("restore_check", tray_thread=getattr(self, "_tray_thread", None), target=path)
         try:
             if not path.is_file() or not path.stat().st_size:
                 return
@@ -2798,7 +2807,12 @@ if __name__ == "__main__":
         from product import notify_already_running
         notify_already_running()
         raise SystemExit(0)
+    diagnostics.initialize(APP_DIR / "diagnostics", VERSION)
     root = tk.Tk()
-    App(root)
+    diagnostics.observe_tk(root)
+    application = App(root)
+    diagnostics.record_desktop("app_ready", tray_thread=getattr(application, "_tray_thread", None))
     root.mainloop()
+    diagnostics.record_desktop("mainloop_returned")
     instance.release()
+    diagnostics.record("normal_exit")

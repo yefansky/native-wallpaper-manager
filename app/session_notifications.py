@@ -1,6 +1,7 @@
 """Receive session changes for the Tk window using the Windows WTS API."""
 import ctypes
 from ctypes import wintypes
+import runtime_diagnostics as diagnostics
 
 WM_WTSSESSION_CHANGE = 0x02B1
 RESTORE_EVENTS = {1, 3, 5, 8}  # console connect, remote connect, logon, unlock
@@ -27,6 +28,8 @@ class SessionNotifications:
         proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
         def proc(window, message, wparam, lparam):
+            if message == WM_WTSSESSION_CHANGE:
+                diagnostics.record("wts_session_change", event_id=int(wparam))
             if message == WM_WTSSESSION_CHANGE and wparam in RESTORE_EVENTS:
                 try:
                     on_restore()
@@ -44,9 +47,11 @@ class SessionNotifications:
             user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous)
             self.hwnd = None
             raise error
+        diagnostics.record("session_listener_ready")
 
     def close(self):
         if self.hwnd:
+            diagnostics.record("session_listener_closing")
             self.wts.WTSUnRegisterSessionNotification(self.hwnd)
             self.user32.SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.previous)
             self.hwnd = None
