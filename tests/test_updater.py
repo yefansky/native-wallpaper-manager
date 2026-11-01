@@ -45,7 +45,7 @@ class UpdateTests(unittest.TestCase):
         payload['assets'][0]['url'] = 'https://api.github.com/repos/attacker/repo/releases/assets/1'
         self.client.session.get.return_value = response(json.dumps(payload).encode())
         with self.assertRaises(updater.UpdateError):
-            self.client.check()
+            self.client.check('0.1.11')
 
     def test_anonymous_check_succeeds_without_authorization(self):
         # 公开仓库匿名读取 Release：空 token 也能检查，且请求头不带 Authorization。
