@@ -9,6 +9,7 @@ import ctypes
 import os
 import time
 import winreg
+from uuid import UUID
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -20,6 +21,57 @@ SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
 SUPPORTED_IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png"}
 WALLPAPER_BUFFER_CHARS = 32768
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+
+def _set_desktop_wallpaper(path: Path) -> None:
+    """Set the Shell's persistent wallpaper, independently of this process.
+
+    SPI alone can be rolled back when an RDP session disconnects. The public
+    Windows 8+ IDesktopWallpaper interface updates the Shell's wallpaper state.
+    COM belongs to the calling thread; do not initialize it at module import.
+    """
+    ole32 = ctypes.WinDLL("ole32")
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = [ctypes.POINTER(_GUID), ctypes.c_void_p, ctypes.c_ulong,
+                                     ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+
+    def check(result: int, stage: str) -> None:
+        if result < 0:
+            raise OSError(f"Windows Shell 壁纸设置失败：{stage} (HRESULT 0x{result & 0xffffffff:08X})")
+
+    initialized = ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+    # A host can have already initialized this thread with a different apartment.
+    # Use that apartment, but never uninitialize the host's COM reference.
+    if initialized & 0xffffffff != 0x80010106:  # RPC_E_CHANGED_MODE
+        check(initialized, "CoInitializeEx")
+    try:
+        clsid = _GUID.from_buffer_copy(UUID("C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD").bytes_le)
+        iid = _GUID.from_buffer_copy(UUID("B92B56A9-8B55-4E14-9A89-0199BBB6F93B").bytes_le)
+        instance = ctypes.c_void_p()
+        # CLSCTX_ALL includes the local Shell server (INPROC alone is insufficient).
+        check(ole32.CoCreateInstance(ctypes.byref(clsid), None, 23, ctypes.byref(iid),
+                                     ctypes.byref(instance)), "CoCreateInstance")
+        if not instance.value:
+            raise OSError("Windows Shell 未返回壁纸接口")
+        table = ctypes.cast(instance, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(table[2])
+        try:
+            setter = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p,
+                                       ctypes.c_wchar_p)(table[3])
+            check(setter(instance, None, str(path)), "IDesktopWallpaper.SetWallpaper")
+        finally:
+            release(instance)
+    finally:
+        if initialized >= 0:  # S_OK and S_FALSE both increment COM's reference count.
+            ole32.CoUninitialize()
 
 
 @dataclass(frozen=True)
@@ -95,10 +147,14 @@ def set_native_wallpaper(
     if not requested.is_file() or requested.stat().st_size == 0:
         raise ValueError("壁纸文件不存在或为空")
 
-    setter = system_parameters_info or _system_parameters_info
-    flags = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-    if not setter(SPI_SETDESKWALLPAPER, 0, str(requested), flags):
-        raise ctypes.WinError()
+    if system_parameters_info is not None:
+        # Retain the existing explicit injection for offline adapter tests.
+        # Production never falls back to SPI after a Shell failure.
+        flags = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+        if not system_parameters_info(SPI_SETDESKWALLPAPER, 0, str(requested), flags):
+            raise ctypes.WinError()
+    else:
+        _set_desktop_wallpaper(requested)
 
     reader = current_reader or current_native_wallpaper
     clock = monotonic or time.monotonic
